@@ -324,7 +324,9 @@ ftl_get_num_bands(const struct spdk_ftl_dev *dev)
 static inline size_t
 ftl_get_num_punits(const struct spdk_ftl_dev *dev)
 {
-	return spdk_bdev_get_optimal_open_zones(spdk_bdev_desc_get_bdev(dev->base_bdev_desc));
+    /* TODO "yasharzb": For our work, each band only has one punit */
+    size_t num = spdk_bdev_get_optimal_open_zones(spdk_bdev_desc_get_bdev(dev->base_bdev_desc));
+    return num > 1 ? 1 : num;
 }
 
 static inline size_t

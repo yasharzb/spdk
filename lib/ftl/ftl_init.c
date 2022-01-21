@@ -931,10 +931,12 @@ ftl_dev_get_zone_info_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 			zone->info.write_pointer = zone->info.zone_id + zone->info.capacity;
 		}
 
+		/* TODO "yasharzb": removing num_zones++ as bands only contain one zone
 		if (zone->info.state != SPDK_BDEV_ZONE_STATE_OFFLINE) {
 			band->num_zones++;
 			CIRCLEQ_INSERT_TAIL(&band->zones, zone, circleq);
 		}
+		 */
 	}
 
 	init_ctx->zone_id = init_ctx->zone_id + num_zones * ftl_get_num_blocks_in_zone(dev);
