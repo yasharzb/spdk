@@ -107,9 +107,10 @@ test_idxd_wq_config(void)
 	struct spdk_user_idxd_device user_idxd = {};
 	struct spdk_idxd_device *idxd = &user_idxd.idxd;
 	union idxd_wqcfg wqcfg = {};
-	uint32_t expected[8] = {0x40, 0, 0x11, 0x9e, 0, 0, 0x40000000, 0};
-	uint32_t wq_size;
-	int rc, i, j;
+	uint32_t expected[8] = {0x40, 0, 0x11, 0xbe, 0, 0, 0x40000000, 0};
+	uint32_t wq_size, i, j;
+	uint32_t wqcap_size = 32;
+	int rc;
 
 	user_idxd.reg_base = calloc(1, FAKE_REG_SIZE);
 	SPDK_CU_ASSERT_FATAL(user_idxd.reg_base != NULL);
@@ -139,10 +140,9 @@ test_idxd_wq_config(void)
 	}
 
 	for (i = 0 ; i < user_idxd.registers.wqcap.num_wqs; i++) {
-		for (j = 0 ; j < WQCFG_NUM_DWORDS; j++) {
-			wqcfg.raw[j] = spdk_mmio_read_4((uint32_t *)(user_idxd.reg_base + user_idxd.wqcfg_offset + i * 32 +
-							j *
-							4));
+		for (j = 0 ; j < (sizeof(union idxd_wqcfg) / sizeof(uint32_t)); j++) {
+			wqcfg.raw[j] = spdk_mmio_read_4((uint32_t *)(user_idxd.reg_base +
+							user_idxd.wqcfg_offset + i * wqcap_size + j * sizeof(uint32_t)));
 			CU_ASSERT(wqcfg.raw[j] == expected[j]);
 		}
 	}
@@ -172,7 +172,7 @@ test_idxd_group_config(void)
 	user_idxd.registers.groupcap.num_groups = g_user_dev_cfg.num_groups;
 	user_idxd.registers.enginecap.num_engines = g_user_dev_cfg.total_engines;
 	user_idxd.registers.wqcap.num_wqs = g_user_dev_cfg.total_wqs;
-	user_idxd.registers.groupcap.total_tokens = MAX_TOKENS;
+	user_idxd.registers.groupcap.read_bufs = MAX_TOKENS;
 	user_idxd.grpcfg_offset = GRP_CFG_OFFSET;
 
 	rc = idxd_group_config(idxd);

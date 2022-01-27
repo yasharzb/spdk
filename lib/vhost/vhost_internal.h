@@ -47,6 +47,13 @@
 
 extern bool g_packed_ring_recovery;
 
+/**
+ * DPDK calls our callbacks synchronously but the work those callbacks
+ * perform needs to be async. Luckily, all DPDK callbacks are called on
+ * a DPDK-internal pthread, so we'll just wait on a semaphore in there.
+ */
+extern sem_t g_dpdk_sem;
+
 #define SPDK_VHOST_MAX_VQUEUES	256
 #define SPDK_VHOST_MAX_VQ_SIZE	1024
 
@@ -89,6 +96,9 @@ extern bool g_packed_ring_recovery;
 typedef struct rte_vhost_resubmit_desc spdk_vhost_resubmit_desc;
 typedef struct rte_vhost_resubmit_info spdk_vhost_resubmit_info;
 typedef struct rte_vhost_inflight_desc_packed	spdk_vhost_inflight_desc;
+
+/* Path to folder where character device will be created. Can be set by user. */
+extern char g_vhost_user_dev_dirname[PATH_MAX];
 
 struct spdk_vhost_virtqueue {
 	struct rte_vhost_vring vring;
@@ -505,5 +515,12 @@ int vhost_get_mem_table(int vid, struct rte_vhost_memory **mem);
 int vhost_get_negotiated_features(int vid, uint64_t *negotiated_features);
 
 int remove_vhost_controller(struct spdk_vhost_dev *vdev);
+
+/* Function calls from vhost.c to rte_vhost_user.c,
+ * shall removed once virtio transport abstraction is complete. */
+int vhost_user_session_set_coalescing(struct spdk_vhost_dev *vdev,
+				      struct spdk_vhost_session *vsession, void *ctx);
+int vhost_user_dev_set_coalescing(struct spdk_vhost_dev *vdev, uint32_t delay_base_us,
+				  uint32_t iops_threshold);
 
 #endif /* SPDK_VHOST_INTERNAL_H */

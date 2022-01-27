@@ -2,6 +2,7 @@
  *   BSD LICENSE
  *   Copyright (c) Intel Corporation. All rights reserved.
  *   Copyright (c) 2019, Nutanix Inc. All rights reserved.
+ *   Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -75,7 +76,6 @@
 #define NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR (NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR / 4)
 
 struct nvmf_vfio_user_req;
-struct nvmf_vfio_user_qpair;
 
 typedef int (*nvmf_vfio_user_req_cb_fn)(struct nvmf_vfio_user_req *req, void *cb_arg);
 
@@ -85,6 +85,100 @@ typedef int (*nvmf_vfio_user_req_cb_fn)(struct nvmf_vfio_user_req *req, void *cb
 enum nvmf_vfio_user_req_state {
 	VFIO_USER_REQUEST_STATE_FREE = 0,
 	VFIO_USER_REQUEST_STATE_EXECUTING,
+};
+
+/* NVMe device state representation */
+struct nvme_migr_sq_state {
+	uint16_t	sqid;
+	uint16_t	cqid;
+	uint32_t	head;
+	uint32_t	size;
+	uint32_t	reserved;
+	uint64_t	dma_addr;
+};
+SPDK_STATIC_ASSERT(sizeof(struct nvme_migr_sq_state) == 0x18, "Incorrect size");
+
+struct nvme_migr_cq_state {
+	uint16_t	cqid;
+	uint16_t	phase;
+	uint32_t	tail;
+	uint32_t	size;
+	uint32_t	iv;
+	uint32_t	ien;
+	uint32_t	reserved;
+	uint64_t	dma_addr;
+};
+SPDK_STATIC_ASSERT(sizeof(struct nvme_migr_cq_state) == 0x20, "Incorrect size");
+
+#define VFIO_USER_NVME_MIGR_MAGIC	0xAFEDBC23
+
+/* The device state is in VFIO MIGRATION BAR(9) region, keep the device state page aligned.
+ *
+ * NVMe device migration region is defined as below:
+ * ----------------------------------------------------------------------
+ * | nvme_migr_device_state | private controller data | queue pairs | BARs |
+ * ----------------------------------------------------------------------
+ *
+ * Keep nvme_migr_device_state as a fixed 0x1000 length, all new added fields
+ * can use the reserved space at the end of the data structure.
+ */
+struct nvme_migr_device_state {
+	/* Magic value to validate migration data */
+	uint32_t	magic;
+	/* Version to check the data is same from source to destination */
+	uint32_t	version;
+
+	/* The library uses this field to know how many fields in this
+	 * structure are valid, starting at the beginning of this data
+	 * structure.  New added fields in future use `unused` memory
+	 * spaces.
+	 */
+	uint32_t	opts_size;
+	uint32_t	reserved0;
+
+	/* BARs information */
+	uint64_t	bar_offset[VFU_PCI_DEV_NUM_REGIONS];
+	uint64_t	bar_len[VFU_PCI_DEV_NUM_REGIONS];
+
+	/* Queue pair start offset, starting at the beginning of this
+	 * data structure.
+	 */
+	uint64_t	qp_offset;
+	uint64_t	qp_len;
+
+	/* Controller data structure */
+	uint32_t	num_io_queues;
+	uint32_t	reserved1;
+
+	uint16_t	reserved2[3];
+	uint16_t	nr_aers;
+	uint16_t	aer_cids[NVMF_MIGR_MAX_PENDING_AERS];
+
+	/* Controller private data offset and length if exist, starting at
+	 * the beginning of this data structure.
+	 */
+	uint64_t	private_data_offset;
+	uint64_t	private_data_len;
+
+	/* Reserved memory space for new added fields, the
+	 * field is always at the end of this data structure.
+	 */
+	uint8_t		unused[3356];
+};
+SPDK_STATIC_ASSERT(sizeof(struct nvme_migr_device_state) == 0x1000, "Incorrect size");
+
+struct vfio_user_nvme_migr_qp {
+	struct nvme_migr_sq_state	sq;
+	struct nvme_migr_cq_state	cq;
+};
+
+/* NVMe state definition used temporarily to load/restore from/to NVMe migration BAR region */
+struct vfio_user_nvme_migr_state {
+	struct nvme_migr_device_state	ctrlr_data;
+	struct nvmf_ctrlr_migr_data	private_data;
+	struct vfio_user_nvme_migr_qp	qps[NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR];
+	uint8_t				bar0[NVME_REG_BAR0_SIZE];
+	uint8_t				cfg[NVME_REG_CFG_SIZE];
 };
 
 struct nvmf_vfio_user_req  {
@@ -112,6 +206,7 @@ struct nvmf_vfio_user_req  {
  */
 struct nvme_q {
 	bool is_cq;
+	uint32_t qid;
 
 	void *addr;
 
@@ -136,53 +231,112 @@ struct nvme_q {
 	};
 };
 
-enum nvmf_vfio_user_qpair_state {
-	VFIO_USER_QPAIR_UNINITIALIZED = 0,
-	VFIO_USER_QPAIR_ACTIVE,
-	VFIO_USER_QPAIR_SQ_DELETED,
-	VFIO_USER_QPAIR_INACTIVE,
-	VFIO_USER_QPAIR_ERROR,
+enum nvmf_vfio_user_sq_state {
+	VFIO_USER_SQ_UNUSED = 0,
+	VFIO_USER_SQ_CREATED,
+	VFIO_USER_SQ_DELETED,
+	VFIO_USER_SQ_ACTIVE,
+	VFIO_USER_SQ_INACTIVE
 };
 
-struct nvmf_vfio_user_qpair {
+enum nvmf_vfio_user_cq_state {
+	VFIO_USER_CQ_UNUSED = 0,
+	VFIO_USER_CQ_CREATED,
+	VFIO_USER_CQ_DELETED,
+};
+
+enum nvmf_vfio_user_ctrlr_state {
+	VFIO_USER_CTRLR_CREATING = 0,
+	VFIO_USER_CTRLR_RUNNING,
+	/* Quiesce requested by libvfio-user */
+	VFIO_USER_CTRLR_PAUSING,
+	/* NVMf subsystem is paused, it's safe to do PCI reset, memory register,
+	 * memory unergister, and vfio migration state transition in this state.
+	 */
+	VFIO_USER_CTRLR_PAUSED,
+	/*
+	 * Implies that the NVMf subsystem is paused. Device will be unquiesced (PCI
+	 * reset, memory register and unregister, controller in destination VM has
+	 * been restored).  NVMf subsystem resume has been requested.
+	 */
+	VFIO_USER_CTRLR_RESUMING,
+	/*
+	 * Implies that the NVMf subsystem is paused. Both controller in source VM and
+	 * destinatiom VM is in this state when doing live migration.
+	 */
+	VFIO_USER_CTRLR_MIGRATING
+};
+
+/* Migration region to record NVMe device state data structure */
+struct vfio_user_migration_region {
+	uint64_t last_data_offset;
+	uint64_t pending_bytes;
+};
+
+struct nvmf_vfio_user_sq {
 	struct spdk_nvmf_qpair			qpair;
 	struct spdk_nvmf_transport_poll_group	*group;
 	struct nvmf_vfio_user_ctrlr		*ctrlr;
 	struct nvmf_vfio_user_req		*reqs_internal;
 	uint32_t				qsize;
-	struct nvme_q				cq;
-	struct nvme_q				sq;
-	enum nvmf_vfio_user_qpair_state		state;
 
-	/* Copy of Create IO SQ command */
+	struct nvme_q				sq;
+	enum nvmf_vfio_user_sq_state		sq_state;
+
+	/* handle_queue_connect_rsp() can be used both for CREATE IO SQ response
+	 * and SQ re-connect response in the destination VM, for the prior case,
+	 * we will post a NVMe completion to VM, we will not set this flag when
+	 * re-connecting SQs in the destination VM.
+	 */
+	bool					post_create_io_sq_completion;
+	/* Copy of Create IO SQ command, this field is used together with
+	 * `post_create_io_sq_completion` flag.
+	 */
 	struct spdk_nvme_cmd			create_io_sq_cmd;
 
 	TAILQ_HEAD(, nvmf_vfio_user_req)	reqs;
 	/* Poll group entry */
-	TAILQ_ENTRY(nvmf_vfio_user_qpair)	link;
-	/* Connected queue pair entry */
-	TAILQ_ENTRY(nvmf_vfio_user_qpair)	tailq;
+	TAILQ_ENTRY(nvmf_vfio_user_sq)		link;
+	/* Connected SQ entry */
+	TAILQ_ENTRY(nvmf_vfio_user_sq)		tailq;
+};
+
+struct nvmf_vfio_user_cq {
+	struct spdk_nvmf_transport_poll_group	*group;
+	struct spdk_thread			*thread;
+	struct nvme_q				cq;
+	enum nvmf_vfio_user_cq_state		cq_state;
+	uint32_t				cq_ref;
 };
 
 struct nvmf_vfio_user_poll_group {
 	struct spdk_nvmf_transport_poll_group	group;
-	TAILQ_HEAD(, nvmf_vfio_user_qpair)	qps;
+	TAILQ_ENTRY(nvmf_vfio_user_poll_group)	link;
+	TAILQ_HEAD(, nvmf_vfio_user_sq)		sqs;
 };
 
 struct nvmf_vfio_user_ctrlr {
 	struct nvmf_vfio_user_endpoint		*endpoint;
 	struct nvmf_vfio_user_transport		*transport;
 
-	/* Connected queue pairs list */
-	TAILQ_HEAD(, nvmf_vfio_user_qpair)	connected_qps;
+	/* Connected SQs list */
+	TAILQ_HEAD(, nvmf_vfio_user_sq)		connected_sqs;
+	enum nvmf_vfio_user_ctrlr_state		state;
+
+	struct vfio_user_migration_region	migr_reg;
 
 	struct spdk_thread			*thread;
 	struct spdk_poller			*vfu_ctx_poller;
 
+	bool					queued_quiesce;
+
+	bool					reset_shn;
+
 	uint16_t				cntlid;
 	struct spdk_nvmf_ctrlr			*ctrlr;
 
-	struct nvmf_vfio_user_qpair		*qp[NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR];
+	struct nvmf_vfio_user_sq		*sqs[NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR];
+	struct nvmf_vfio_user_cq		*cqs[NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR];
 
 	TAILQ_ENTRY(nvmf_vfio_user_ctrlr)	link;
 
@@ -199,11 +353,16 @@ struct nvmf_vfio_user_endpoint {
 	int					devmem_fd;
 	volatile uint32_t			*doorbells;
 
+	int					migr_fd;
+	void					*migr_data;
+
 	struct spdk_nvme_transport_id		trid;
 	const struct spdk_nvmf_subsystem	*subsystem;
 
 	struct nvmf_vfio_user_ctrlr		*ctrlr;
 	pthread_mutex_t				lock;
+
+	bool					need_async_destroy;
 
 	TAILQ_ENTRY(nvmf_vfio_user_endpoint)	link;
 };
@@ -218,6 +377,10 @@ struct nvmf_vfio_user_transport {
 	struct spdk_poller			*accept_poller;
 	pthread_mutex_t				lock;
 	TAILQ_HEAD(, nvmf_vfio_user_endpoint)	endpoints;
+
+	pthread_mutex_t				pg_lock;
+	TAILQ_HEAD(, nvmf_vfio_user_poll_group)	poll_groups;
+	struct nvmf_vfio_user_poll_group	*next_pg;
 };
 
 /*
@@ -233,7 +396,26 @@ static int
 nvmf_vfio_user_req_free(struct spdk_nvmf_request *req);
 
 static struct nvmf_vfio_user_req *
-get_nvmf_vfio_user_req(struct nvmf_vfio_user_qpair *qpair);
+get_nvmf_vfio_user_req(struct nvmf_vfio_user_sq *vu_sq);
+
+static inline size_t
+vfio_user_migr_data_len(void)
+{
+	size_t len = 0;
+
+	len = NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR * (sizeof(struct nvme_migr_sq_state) + sizeof(
+				struct nvme_migr_cq_state));
+	len += sizeof(struct nvme_migr_device_state);
+	len += sizeof(struct nvmf_ctrlr_migr_data);
+	len += NVME_REG_BAR0_SIZE;
+	len += NVME_REG_CFG_SIZE;
+	/* BAR4 */
+	len += NVME_BAR4_SIZE;
+	/* BAR5 */
+	len += NVME_BAR5_SIZE;
+
+	return SPDK_ALIGN_CEIL(len, PAGE_SIZE);
+}
 
 static int
 nvme_cmd_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
@@ -466,23 +648,6 @@ ctrlr_id(struct nvmf_vfio_user_ctrlr *ctrlr)
 	return endpoint_id(ctrlr->endpoint);
 }
 
-static inline uint16_t
-io_q_id(struct nvme_q *q)
-{
-
-	struct nvmf_vfio_user_qpair *vu_qpair;
-
-	assert(q);
-
-	if (q->is_cq) {
-		vu_qpair = SPDK_CONTAINEROF(q, struct nvmf_vfio_user_qpair, cq);
-	} else {
-		vu_qpair = SPDK_CONTAINEROF(q, struct nvmf_vfio_user_qpair, sq);
-	}
-	assert(vu_qpair);
-	return vu_qpair->qpair.qid;
-}
-
 static void
 fail_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr)
 {
@@ -509,12 +674,22 @@ ctrlr_interrupt_enabled(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
 static void
 nvmf_vfio_user_destroy_endpoint(struct nvmf_vfio_user_endpoint *endpoint)
 {
+	SPDK_DEBUGLOG(nvmf_vfio, "destroy endpoint %s\n", endpoint_id(endpoint));
+
 	if (endpoint->doorbells) {
 		munmap((void *)endpoint->doorbells, NVMF_VFIO_USER_DOORBELLS_SIZE);
 	}
 
 	if (endpoint->devmem_fd > 0) {
 		close(endpoint->devmem_fd);
+	}
+
+	if (endpoint->migr_data) {
+		munmap(endpoint->migr_data, vfio_user_migr_data_len());
+	}
+
+	if (endpoint->migr_fd > 0) {
+		close(endpoint->migr_fd);
 	}
 
 	if (endpoint->vfu_ctx) {
@@ -539,7 +714,8 @@ nvmf_vfio_user_destroy(struct spdk_nvmf_transport *transport,
 					transport);
 
 	spdk_poller_unregister(&vu_transport->accept_poller);
-	(void)pthread_mutex_destroy(&vu_transport->lock);
+	pthread_mutex_destroy(&vu_transport->lock);
+	pthread_mutex_destroy(&vu_transport->pg_lock);
 
 	TAILQ_FOREACH_SAFE(endpoint, &vu_transport->endpoints, link, tmp) {
 		TAILQ_REMOVE(&vu_transport->endpoints, endpoint, link);
@@ -589,23 +765,28 @@ nvmf_vfio_user_create(struct spdk_nvmf_transport_opts *opts)
 		SPDK_ERRLOG("Pthread initialisation failed (%d)\n", err);
 		goto err;
 	}
-
 	TAILQ_INIT(&vu_transport->endpoints);
+
+	err = pthread_mutex_init(&vu_transport->pg_lock, NULL);
+	if (err != 0) {
+		pthread_mutex_destroy(&vu_transport->lock);
+		SPDK_ERRLOG("Pthread initialisation failed (%d)\n", err);
+		goto err;
+	}
+	TAILQ_INIT(&vu_transport->poll_groups);
 
 	if (opts->transport_specific != NULL &&
 	    spdk_json_decode_object_relaxed(opts->transport_specific, vfio_user_transport_opts_decoder,
 					    SPDK_COUNTOF(vfio_user_transport_opts_decoder),
 					    vu_transport)) {
 		SPDK_ERRLOG("spdk_json_decode_object_relaxed failed\n");
-		free(vu_transport);
-		return NULL;
+		goto cleanup;
 	}
 
 	vu_transport->accept_poller = SPDK_POLLER_REGISTER(nvmf_vfio_user_accept, &vu_transport->transport,
-				      vu_transport->transport.opts.acceptor_poll_rate);
+				      opts->acceptor_poll_rate);
 	if (!vu_transport->accept_poller) {
-		free(vu_transport);
-		return NULL;
+		goto cleanup;
 	}
 
 	SPDK_DEBUGLOG(nvmf_vfio, "vfio_user transport: disable_mappable_bar0=%d\n",
@@ -613,20 +794,21 @@ nvmf_vfio_user_create(struct spdk_nvmf_transport_opts *opts)
 
 	return &vu_transport->transport;
 
+cleanup:
+	pthread_mutex_destroy(&vu_transport->lock);
+	pthread_mutex_destroy(&vu_transport->pg_lock);
 err:
 	free(vu_transport);
-
 	return NULL;
 }
 
 static uint32_t
-max_queue_size(struct nvmf_vfio_user_ctrlr const *ctrlr)
+max_queue_size(struct nvmf_vfio_user_ctrlr const *vu_ctrlr)
 {
-	assert(ctrlr != NULL);
-	assert(ctrlr->qp[0] != NULL);
-	assert(ctrlr->qp[0]->qpair.ctrlr != NULL);
+	assert(vu_ctrlr != NULL);
+	assert(vu_ctrlr->ctrlr != NULL);
 
-	return ctrlr->qp[0]->qpair.ctrlr->vcprop.cap.bits.mqes + 1;
+	return vu_ctrlr->ctrlr->vcprop.cap.bits.mqes + 1;
 }
 
 static void *
@@ -653,18 +835,18 @@ map_one(vfu_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec 
 }
 
 static inline uint32_t
-sq_head(struct nvmf_vfio_user_qpair *qpair)
+sq_head(struct nvmf_vfio_user_sq *sq)
 {
-	assert(qpair != NULL);
-	return qpair->sq.head;
+	assert(sq != NULL);
+	return sq->sq.head;
 }
 
 static inline void
-sqhd_advance(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_qpair *qpair)
+sqhd_advance(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_sq *sq)
 {
 	assert(ctrlr != NULL);
-	assert(qpair != NULL);
-	qpair->sq.head = (qpair->sq.head + 1) % qpair->sq.size;
+	assert(sq != NULL);
+	sq->sq.head = (sq->sq.head + 1) % sq->sq.size;
 }
 
 static int
@@ -694,6 +876,15 @@ map_q(struct nvmf_vfio_user_ctrlr *vu_ctrlr, struct nvme_q *q, bool is_cq, bool 
 	return 0;
 }
 
+static inline void
+unmap_q(struct nvmf_vfio_user_ctrlr *vu_ctrlr, struct nvme_q *q)
+{
+	if (q->addr) {
+		vfu_unmap_sg(vu_ctrlr->endpoint->vfu_ctx, q->sg, &q->iov, 1);
+		q->addr = NULL;
+	}
+}
+
 static int
 asq_setup(struct nvmf_vfio_user_ctrlr *ctrlr)
 {
@@ -702,12 +893,13 @@ asq_setup(struct nvmf_vfio_user_ctrlr *ctrlr)
 	int ret;
 
 	assert(ctrlr != NULL);
-	assert(ctrlr->qp[0] != NULL);
-	assert(ctrlr->qp[0]->sq.addr == NULL);
+	assert(ctrlr->sqs[0] != NULL);
+	assert(ctrlr->sqs[0]->sq.addr == NULL);
 	/* XXX ctrlr->asq == 0 is a valid memory address */
 
-	regs = spdk_nvmf_ctrlr_get_regs(ctrlr->qp[0]->qpair.ctrlr);
-	sq = &ctrlr->qp[0]->sq;
+	regs = spdk_nvmf_ctrlr_get_regs(ctrlr->ctrlr);
+	sq = &ctrlr->sqs[0]->sq;
+	sq->qid = 0;
 	sq->size = regs->aqa.bits.asqs + 1;
 	sq->prp1 = regs->asq;
 	sq->head = 0;
@@ -725,7 +917,7 @@ asq_setup(struct nvmf_vfio_user_ctrlr *ctrlr)
 }
 
 static inline int
-queue_index(uint16_t qid, int is_cq)
+queue_index(uint16_t qid, bool is_cq)
 {
 	return (qid * 2) + is_cq;
 }
@@ -737,7 +929,7 @@ tdbl(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvme_q *q)
 	assert(q != NULL);
 	assert(!q->is_cq);
 
-	return &ctrlr->doorbells[queue_index(io_q_id(q), false)];
+	return &ctrlr->doorbells[queue_index(q->qid, false)];
 }
 
 static volatile uint32_t *
@@ -747,7 +939,7 @@ hdbl(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvme_q *q)
 	assert(q != NULL);
 	assert(q->is_cq);
 
-	return &ctrlr->doorbells[queue_index(io_q_id(q), true)];
+	return &ctrlr->doorbells[queue_index(q->qid, true)];
 }
 
 static inline bool
@@ -783,12 +975,13 @@ acq_setup(struct nvmf_vfio_user_ctrlr *ctrlr)
 	int ret;
 
 	assert(ctrlr != NULL);
-	assert(ctrlr->qp[0] != NULL);
-	assert(ctrlr->qp[0]->cq.addr == NULL);
+	assert(ctrlr->cqs[0] != NULL);
+	assert(ctrlr->cqs[0]->cq.addr == NULL);
 
-	regs = spdk_nvmf_ctrlr_get_regs(ctrlr->qp[0]->qpair.ctrlr);
+	regs = spdk_nvmf_ctrlr_get_regs(ctrlr->ctrlr);
 	assert(regs != NULL);
-	cq = &ctrlr->qp[0]->cq;
+	cq = &ctrlr->cqs[0]->cq;
+	cq->qid = 0;
 	cq->size = regs->aqa.bits.acqs + 1;
 	cq->prp1 = regs->acq;
 	cq->tail = 0;
@@ -817,16 +1010,16 @@ _map_one(void *prv, uint64_t addr, uint64_t len, int prot)
 	struct spdk_nvmf_request *req = (struct spdk_nvmf_request *)prv;
 	struct spdk_nvmf_qpair *qpair;
 	struct nvmf_vfio_user_req *vu_req;
-	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
 	void *ret;
 
 	assert(req != NULL);
 	qpair = req->qpair;
 	vu_req = SPDK_CONTAINEROF(req, struct nvmf_vfio_user_req, req);
-	vu_qpair = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_qpair, qpair);
+	vu_sq = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_sq, qpair);
 
 	assert(vu_req->iovcnt < NVMF_VFIO_USER_MAX_IOVECS);
-	ret = map_one(vu_qpair->ctrlr->endpoint->vfu_ctx, addr, len,
+	ret = map_one(vu_sq->ctrlr->endpoint->vfu_ctx, addr, len,
 		      vu_req_to_sg_t(vu_req, vu_req->iovcnt),
 		      &vu_req->iov[vu_req->iovcnt], prot);
 	if (spdk_likely(ret != NULL)) {
@@ -848,13 +1041,13 @@ vfio_user_map_cmd(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvmf_request *
 
 static int
 handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
-	       struct nvmf_vfio_user_qpair *vu_qpair);
+	       struct nvmf_vfio_user_sq *vu_sq);
 
 /*
  * Posts a CQE in the completion queue.
  *
  * @ctrlr: the vfio-user controller
- * @cq: the completion queue
+ * @vu_cq: the completion queue
  * @cdw0: cdw0 as reported by NVMf
  * @sqid: submission queue ID
  * @cid: command identifier in NVMe command
@@ -862,20 +1055,21 @@ handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
  * @sct: the NVMe CQE status code type
  */
 static int
-post_completion(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvme_q *cq,
+post_completion(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_cq *vu_cq,
 		uint32_t cdw0, uint16_t sqid, uint16_t cid, uint16_t sc, uint16_t sct)
 {
 	struct spdk_nvme_cpl *cpl;
+	struct nvme_q *cq;
 	const struct spdk_nvmf_registers *regs;
 	int err;
 
 	assert(ctrlr != NULL);
 
-	if (spdk_unlikely(cq == NULL || cq->addr == NULL)) {
+	if (spdk_unlikely(vu_cq == NULL || vu_cq->cq.addr == NULL)) {
 		return 0;
 	}
 
-	regs = spdk_nvmf_ctrlr_get_regs(ctrlr->qp[0]->qpair.ctrlr);
+	regs = spdk_nvmf_ctrlr_get_regs(ctrlr->ctrlr);
 	if (regs->csts.bits.shst != SPDK_NVME_SHST_NORMAL) {
 		SPDK_DEBUGLOG(nvmf_vfio,
 			      "%s: ignore completion SQ%d cid=%d status=%#x\n",
@@ -883,30 +1077,33 @@ post_completion(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvme_q *cq,
 		return 0;
 	}
 
+	cq = &vu_cq->cq;
 	if (cq_is_full(ctrlr, cq)) {
 		SPDK_ERRLOG("%s: CQ%d full (tail=%d, head=%d)\n",
-			    ctrlr_id(ctrlr), io_q_id(cq), cq->tail, *hdbl(ctrlr, cq));
+			    ctrlr_id(ctrlr), cq->qid, cq->tail, *hdbl(ctrlr, cq));
 		return -1;
 	}
 
 	cpl = ((struct spdk_nvme_cpl *)cq->addr) + cq->tail;
 
-	assert(ctrlr->qp[sqid] != NULL);
+	assert(ctrlr->sqs[sqid] != NULL);
 	SPDK_DEBUGLOG(nvmf_vfio,
 		      "%s: request complete SQ%d cid=%d status=%#x SQ head=%#x CQ tail=%#x\n",
-		      ctrlr_id(ctrlr), sqid, cid, sc, sq_head(ctrlr->qp[sqid]),
+		      ctrlr_id(ctrlr), sqid, cid, sc, sq_head(ctrlr->sqs[sqid]),
 		      cq->tail);
 
-	cpl->sqhd = sq_head(ctrlr->qp[sqid]);
+	cpl->sqhd = sq_head(ctrlr->sqs[sqid]);
 	cpl->sqid = sqid;
 	cpl->cid = cid;
 	cpl->cdw0 = cdw0;
 	cpl->status.dnr = 0x0;
 	cpl->status.m = 0x0;
 	cpl->status.sct = sct;
-	cpl->status.p = cq->phase;
 	cpl->status.sc = sc;
+	cpl->status.p = cq->phase;
 
+	/* Ensure the Completion Queue Entry is visible. */
+	spdk_wmb();
 	cq_tail_advance(cq);
 
 	/*
@@ -935,81 +1132,81 @@ io_q_exists(struct nvmf_vfio_user_ctrlr *vu_ctrlr, const uint16_t qid, const boo
 		return false;
 	}
 
-	if (vu_ctrlr->qp[qid] == NULL) {
+	if (is_cq) {
+		if (vu_ctrlr->cqs[qid] == NULL) {
+			return false;
+		}
+
+		return (vu_ctrlr->cqs[qid]->cq_state != VFIO_USER_CQ_DELETED &&
+			vu_ctrlr->cqs[qid]->cq_state != VFIO_USER_CQ_UNUSED);
+	}
+
+	if (vu_ctrlr->sqs[qid] == NULL) {
 		return false;
 	}
 
-	if (!is_cq) {
-		if (vu_ctrlr->qp[qid]->state == VFIO_USER_QPAIR_SQ_DELETED ||
-		    vu_ctrlr->qp[qid]->state == VFIO_USER_QPAIR_UNINITIALIZED) {
-			return false;
-		}
-	}
-
-	return true;
+	return (vu_ctrlr->sqs[qid]->sq_state != VFIO_USER_SQ_DELETED &&
+		vu_ctrlr->sqs[qid]->sq_state != VFIO_USER_SQ_UNUSED);
 }
 
+/* Deletes a SQ, if this SQ is the last user of the associated CQ
+ * and the controller is being shut down or reset, then the CQ is
+ * also deleted.
+ */
 static void
-unmap_qp(struct nvmf_vfio_user_qpair *qp)
+delete_sq_done(struct nvmf_vfio_user_ctrlr *vu_ctrlr, struct nvmf_vfio_user_sq *vu_sq)
 {
-	struct nvmf_vfio_user_ctrlr *ctrlr;
+	struct nvmf_vfio_user_cq *vu_cq;
+	struct nvmf_vfio_user_req *vu_req;
+	uint16_t cqid;
+	uint32_t i;
 
-	if (qp->ctrlr == NULL) {
-		return;
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: delete SQ%d=%p done\n", ctrlr_id(vu_ctrlr),
+		      vu_sq->sq.qid, vu_sq);
+
+	/* Free SQ resources */
+	unmap_q(vu_ctrlr, &vu_sq->sq);
+
+	for (i = 0; i < vu_sq->qsize; i++) {
+		vu_req = &vu_sq->reqs_internal[i];
+		free(vu_req->sg);
 	}
-	ctrlr = qp->ctrlr;
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: unmap QP%d\n",
-		      ctrlr_id(ctrlr), qp->qpair.qid);
-
-	if (qp->sq.addr != NULL) {
-		vfu_unmap_sg(ctrlr->endpoint->vfu_ctx, qp->sq.sg, &qp->sq.iov, 1);
-		qp->sq.addr = NULL;
+	if (vu_sq->qsize) {
+		vu_sq->qsize = 0;
+		free(vu_sq->reqs_internal);
 	}
+	vu_sq->sq.size = 0;
+	vu_sq->sq_state = VFIO_USER_SQ_DELETED;
 
-	if (qp->cq.addr != NULL) {
-		vfu_unmap_sg(ctrlr->endpoint->vfu_ctx, qp->cq.sg, &qp->cq.iov, 1);
-		qp->cq.addr = NULL;
-	}
-}
+	/* Controller RESET and SHUTDOWN are special cases,
+	 * VM may not send DELETE IO SQ/CQ commands, NVMf library
+	 * will disconnect IO queue pairs.
+	 */
+	if (vu_ctrlr->reset_shn) {
+		cqid = vu_sq->sq.cqid;
+		vu_cq = vu_ctrlr->cqs[cqid];
 
-static int
-remap_qp(struct nvmf_vfio_user_qpair *vu_qpair)
-{
-	struct nvme_q *sq, *cq;
-	struct nvmf_vfio_user_ctrlr *vu_ctrlr;
-	int ret;
+		SPDK_DEBUGLOG(nvmf_vfio, "%s: try to delete CQ%d=%p\n", ctrlr_id(vu_ctrlr),
+			      vu_cq->cq.qid, vu_cq);
 
-	vu_ctrlr = vu_qpair->ctrlr;
-	sq = &vu_qpair->sq;
-	cq = &vu_qpair->cq;
-
-	if (sq->size) {
-		ret = map_q(vu_ctrlr, sq, false, false);
-		if (ret) {
-			SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap SQID %d %#lx-%#lx\n",
-				      io_q_id(sq), sq->prp1, sq->prp1 + sq->size * sizeof(struct spdk_nvme_cmd));
-			return -EFAULT;
+		if (vu_cq->cq_ref) {
+			vu_cq->cq_ref--;
+		}
+		if (vu_cq->cq_ref == 0) {
+			unmap_q(vu_ctrlr, &vu_cq->cq);
+			vu_cq->cq.size = 0;
+			vu_cq->cq_state = VFIO_USER_CQ_DELETED;
+			vu_cq->group = NULL;
 		}
 	}
-
-	if (cq->size) {
-		ret = map_q(vu_ctrlr, cq, true, false);
-		if (ret) {
-			SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap CQID %d %#lx-%#lx\n",
-				      io_q_id(cq), cq->prp1, cq->prp1 + cq->size * sizeof(struct spdk_nvme_cpl));
-			return -EFAULT;
-		}
-
-	}
-
-	return 0;
 }
 
 static void
 free_qp(struct nvmf_vfio_user_ctrlr *ctrlr, uint16_t qid)
 {
-	struct nvmf_vfio_user_qpair *qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
+	struct nvmf_vfio_user_cq *vu_cq;
 	struct nvmf_vfio_user_req *vu_req;
 	uint32_t i;
 
@@ -1017,99 +1214,126 @@ free_qp(struct nvmf_vfio_user_ctrlr *ctrlr, uint16_t qid)
 		return;
 	}
 
-	qpair = ctrlr->qp[qid];
-	if (qpair == NULL) {
-		return;
+	vu_sq = ctrlr->sqs[qid];
+	if (vu_sq) {
+		SPDK_DEBUGLOG(nvmf_vfio, "%s: Free SQ %u\n", ctrlr_id(ctrlr), qid);
+		unmap_q(ctrlr, &vu_sq->sq);
+
+		for (i = 0; i < vu_sq->qsize; i++) {
+			vu_req = &vu_sq->reqs_internal[i];
+			free(vu_req->sg);
+		}
+		if (vu_sq->qsize) {
+			free(vu_sq->reqs_internal);
+		}
+
+		free(vu_sq->sq.sg);
+		free(vu_sq);
+		ctrlr->sqs[qid] = NULL;
 	}
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: destroy QP%d=%p\n", ctrlr_id(ctrlr),
-		      qid, qpair);
-
-	unmap_qp(qpair);
-
-	for (i = 0; i < qpair->qsize; i++) {
-		vu_req = &qpair->reqs_internal[i];
-		free(vu_req->sg);
+	vu_cq = ctrlr->cqs[qid];
+	if (vu_cq) {
+		SPDK_DEBUGLOG(nvmf_vfio, "%s: Free CQ %u\n", ctrlr_id(ctrlr), qid);
+		unmap_q(ctrlr, &vu_cq->cq);
+		free(vu_cq->cq.sg);
+		free(vu_cq);
+		ctrlr->cqs[qid] = NULL;
 	}
-	free(qpair->reqs_internal);
-
-	free(qpair->sq.sg);
-	free(qpair->cq.sg);
-	free(qpair);
-
-	ctrlr->qp[qid] = NULL;
 }
 
-/* This function can only fail because of memory allocation errors. */
 static int
-init_qp(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
-	const uint32_t qsize, const uint16_t id)
+init_sq(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
+	const uint16_t id)
 {
-	uint32_t i;
-	struct nvmf_vfio_user_qpair *qpair;
-	struct nvmf_vfio_user_req *vu_req, *tmp;
-	struct spdk_nvmf_request *req;
+	struct nvmf_vfio_user_sq *vu_sq;
 
 	assert(ctrlr != NULL);
 	assert(transport != NULL);
+	assert(ctrlr->sqs[id] == NULL);
 
-	qpair = calloc(1, sizeof(*qpair));
-	if (qpair == NULL) {
+	vu_sq = calloc(1, sizeof(*vu_sq));
+	if (vu_sq == NULL) {
 		return -ENOMEM;
 	}
-	qpair->sq.sg = calloc(1, dma_sg_size());
-	if (qpair->sq.sg == NULL) {
-		free(qpair);
-		return -ENOMEM;
-	}
-	qpair->cq.sg = calloc(1, dma_sg_size());
-	if (qpair->cq.sg == NULL) {
-		free(qpair->sq.sg);
-		free(qpair);
+	vu_sq->sq.sg = calloc(1, dma_sg_size());
+	if (vu_sq->sq.sg == NULL) {
+		free(vu_sq);
 		return -ENOMEM;
 	}
 
-	qpair->qpair.qid = id;
-	qpair->qpair.transport = transport;
-	qpair->ctrlr = ctrlr;
-	qpair->qsize = qsize;
+	vu_sq->sq.qid = id;
+	vu_sq->qpair.qid = id;
+	vu_sq->qpair.transport = transport;
+	vu_sq->ctrlr = ctrlr;
+	ctrlr->sqs[id] = vu_sq;
 
-	TAILQ_INIT(&qpair->reqs);
+	return 0;
+}
 
-	qpair->reqs_internal = calloc(qsize, sizeof(struct nvmf_vfio_user_req));
-	if (qpair->reqs_internal == NULL) {
-		SPDK_ERRLOG("%s: error allocating reqs: %m\n", ctrlr_id(ctrlr));
-		goto reqs_err;
+static int
+init_cq(struct nvmf_vfio_user_ctrlr *vu_ctrlr, const uint16_t id)
+{
+	struct nvmf_vfio_user_cq *vu_cq;
+
+	assert(vu_ctrlr != NULL);
+	assert(vu_ctrlr->cqs[id] == NULL);
+
+	vu_cq = calloc(1, sizeof(*vu_cq));
+	if (vu_cq == NULL) {
+		return -ENOMEM;
+	}
+	vu_cq->cq.sg = calloc(1, dma_sg_size());
+	if (vu_cq->cq.sg == NULL) {
+		free(vu_cq);
+		return -ENOMEM;
+	}
+
+	vu_cq->cq.qid = id;
+	vu_ctrlr->cqs[id] = vu_cq;
+
+	return 0;
+}
+
+static int
+alloc_sq_reqs(struct nvmf_vfio_user_ctrlr *vu_ctrlr, struct nvmf_vfio_user_sq *vu_sq,
+	      const uint32_t qsize)
+{
+	uint32_t i;
+	struct nvmf_vfio_user_req *vu_req, *tmp;
+	struct spdk_nvmf_request *req;
+
+	TAILQ_INIT(&vu_sq->reqs);
+
+	vu_sq->reqs_internal = calloc(qsize, sizeof(struct nvmf_vfio_user_req));
+	if (vu_sq->reqs_internal == NULL) {
+		SPDK_ERRLOG("%s: error allocating reqs: %m\n", ctrlr_id(vu_ctrlr));
+		return -ENOMEM;
 	}
 
 	for (i = 0; i < qsize; i++) {
-		vu_req = &qpair->reqs_internal[i];
+		vu_req = &vu_sq->reqs_internal[i];
 		vu_req->sg = calloc(NVMF_VFIO_USER_MAX_IOVECS, dma_sg_size());
 		if (vu_req->sg == NULL) {
 			goto sg_err;
 		}
 
 		req = &vu_req->req;
-		req->qpair = &qpair->qpair;
+		req->qpair = &vu_sq->qpair;
 		req->rsp = (union nvmf_c2h_msg *)&vu_req->rsp;
 		req->cmd = (union nvmf_h2c_msg *)&vu_req->cmd;
 
-		TAILQ_INSERT_TAIL(&qpair->reqs, vu_req, link);
+		TAILQ_INSERT_TAIL(&vu_sq->reqs, vu_req, link);
 	}
 
-	ctrlr->qp[id] = qpair;
+	vu_sq->qsize = qsize;
 	return 0;
 
 sg_err:
-	TAILQ_FOREACH_SAFE(vu_req, &qpair->reqs, link, tmp) {
+	TAILQ_FOREACH_SAFE(vu_req, &vu_sq->reqs, link, tmp) {
 		free(vu_req->sg);
 	}
-	free(qpair->reqs_internal);
-
-reqs_err:
-	free(qpair->sq.sg);
-	free(qpair->cq.sg);
-	free(qpair);
+	free(vu_sq->reqs_internal);
 	return -ENOMEM;
 }
 
@@ -1126,7 +1350,8 @@ handle_create_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 	uint16_t sc = SPDK_NVME_SC_SUCCESS;
 	uint16_t sct = SPDK_NVME_SCT_GENERIC;
 	int err = 0;
-	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
+	struct nvmf_vfio_user_cq *vu_cq;
 	struct nvme_q *io_q;
 	struct nvmf_vfio_user_transport *vu_transport = ctrlr->transport;
 
@@ -1161,8 +1386,15 @@ handle_create_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 	SPDK_DEBUGLOG(nvmf_vfio,
 		      "%s: create I/O %cQ%d: QSIZE=%#x\n", ctrlr_id(ctrlr),
 		      is_cq ? 'C' : 'S', qid, qsize);
-
 	if (is_cq) {
+		if (ctrlr->cqs[qid] == NULL) {
+			err = init_cq(ctrlr, qid);
+			if (err != 0) {
+				sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+				goto out;
+			}
+		}
+
 		if (cmd->cdw11_bits.create_io_cq.pc != 0x1) {
 			SPDK_ERRLOG("%s: non-PC CQ not supporred\n", ctrlr_id(ctrlr));
 			sc = SPDK_NVME_SC_INVALID_FIELD;
@@ -1174,18 +1406,17 @@ handle_create_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 			sc = SPDK_NVME_SC_INVALID_INTERRUPT_VECTOR;
 			goto out;
 		}
-
-		err = init_qp(ctrlr, ctrlr->qp[0]->qpair.transport, qsize, qid);
-		if (err != 0) {
-			sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-			goto out;
+		vu_cq = ctrlr->cqs[qid];
+		io_q = &vu_cq->cq;
+	} else {
+		if (ctrlr->sqs[qid] == NULL) {
+			err = init_sq(ctrlr, ctrlr->sqs[0]->qpair.transport, qid);
+			if (err != 0) {
+				sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+				goto out;
+			}
 		}
 
-		io_q = &ctrlr->qp[qid]->cq;
-		io_q->ien = cmd->cdw11_bits.create_io_cq.ien;
-		io_q->iv = cmd->cdw11_bits.create_io_cq.iv;
-		io_q->phase = true;
-	} else {
 		cqid = cmd->cdw11_bits.create_io_sq.cqid;
 		if (cqid == 0 || cqid >= vu_transport->transport.opts.max_qpairs_per_ctrlr) {
 			SPDK_ERRLOG("%s: invalid CQID %u\n", ctrlr_id(ctrlr), cqid);
@@ -1207,17 +1438,11 @@ handle_create_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 			sc = SPDK_NVME_SC_INVALID_FIELD;
 			goto out;
 		}
-		/* TODO: support shared IO CQ */
-		if (qid != cqid) {
-			SPDK_ERRLOG("%s: doesn't support shared CQ now\n", ctrlr_id(ctrlr));
-			sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
-			sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
-		}
 
-		io_q = &ctrlr->qp[qid]->sq;
-		io_q->cqid = cqid;
+		vu_sq = ctrlr->sqs[qid];
+		io_q = &vu_sq->sq;
 		SPDK_DEBUGLOG(nvmf_vfio, "%s: SQ%d CQID=%d\n", ctrlr_id(ctrlr),
-			      qid, io_q->cqid);
+			      qid, cqid);
 	}
 
 	io_q->is_cq = is_cq;
@@ -1236,48 +1461,58 @@ handle_create_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 		      qid, cmd->dptr.prp.prp1, (unsigned long long)io_q->addr);
 
 	if (is_cq) {
+		io_q->ien = cmd->cdw11_bits.create_io_cq.ien;
+		io_q->iv = cmd->cdw11_bits.create_io_cq.iv;
+		io_q->phase = true;
+		io_q->tail = 0;
+		vu_cq->cq_state = VFIO_USER_CQ_CREATED;
 		*hdbl(ctrlr, io_q) = 0;
 	} else {
-		vu_qpair = ctrlr->qp[qid];
-		*tdbl(ctrlr, io_q) = 0;
-		vu_qpair->sq.head = 0;
-
-		if (vu_qpair->state == VFIO_USER_QPAIR_SQ_DELETED) {
-			vu_qpair->state = VFIO_USER_QPAIR_ACTIVE;
-		} else {
-			/*
-			 * Create our new I/O qpair. This asynchronously invokes, on a
-			 * suitable poll group, the nvmf_vfio_user_poll_group_add()
-			 * callback, which will call spdk_nvmf_request_exec_fabrics()
-			 * with a generated fabrics connect command. This command is
-			 * then eventually completed via handle_queue_connect_rsp().
-			 */
-			vu_qpair->create_io_sq_cmd = *cmd;
-			spdk_nvmf_tgt_new_qpair(ctrlr->transport->transport.tgt,
-						&vu_qpair->qpair);
-			return 0;
+		err = alloc_sq_reqs(ctrlr, vu_sq, qsize);
+		if (err < 0) {
+			sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			SPDK_ERRLOG("%s: failed to allocate SQ requests: %m\n", ctrlr_id(ctrlr));
+			goto out;
 		}
+		io_q->cqid = cqid;
+		io_q->head = 0;
+		ctrlr->cqs[io_q->cqid]->cq_ref++;
+		vu_sq->sq_state = VFIO_USER_SQ_CREATED;
+		*tdbl(ctrlr, io_q) = 0;
+
+		/*
+		 * Create our new I/O qpair. This asynchronously invokes, on a
+		 * suitable poll group, the nvmf_vfio_user_poll_group_add()
+		 * callback, which will call spdk_nvmf_request_exec_fabrics()
+		 * with a generated fabrics connect command. This command is
+		 * then eventually completed via handle_queue_connect_rsp().
+		 */
+		vu_sq->create_io_sq_cmd = *cmd;
+		vu_sq->post_create_io_sq_completion = true;
+		spdk_nvmf_tgt_new_qpair(ctrlr->transport->transport.tgt,
+					&vu_sq->qpair);
+		return 0;
 	}
 
 out:
-	return post_completion(ctrlr, &ctrlr->qp[0]->cq, 0, 0, cmd->cid, sc, sct);
+	return post_completion(ctrlr, ctrlr->cqs[0], 0, 0, cmd->cid, sc, sct);
 }
 
-/* For ADMIN I/O DELETE COMPLETION QUEUE the NVMf library will disconnect and free
+/* For ADMIN I/O DELETE SUBMISSION QUEUE the NVMf library will disconnect and free
  * queue pair, so save the command in a context.
  */
-struct vfio_user_delete_cq_ctx {
+struct vfio_user_delete_sq_ctx {
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr;
-	struct spdk_nvme_cmd delete_io_cq_cmd;
+	struct spdk_nvme_cmd delete_io_sq_cmd;
 };
 
 static void
 vfio_user_qpair_delete_cb(void *cb_arg)
 {
-	struct vfio_user_delete_cq_ctx *ctx = cb_arg;
+	struct vfio_user_delete_sq_ctx *ctx = cb_arg;
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr = ctx->vu_ctrlr;
 
-	post_completion(vu_ctrlr, &vu_ctrlr->qp[0]->cq, 0, 0, ctx->delete_io_cq_cmd.cid,
+	post_completion(vu_ctrlr, vu_ctrlr->cqs[0], 0, 0, ctx->delete_io_sq_cmd.cid,
 			SPDK_NVME_SC_SUCCESS, SPDK_NVME_SCT_GENERIC);
 	free(ctx);
 }
@@ -1291,8 +1526,9 @@ handle_del_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 {
 	uint16_t sct = SPDK_NVME_SCT_GENERIC;
 	uint16_t sc = SPDK_NVME_SC_SUCCESS;
-	struct nvmf_vfio_user_qpair *vu_qpair;
-	struct vfio_user_delete_cq_ctx *ctx;
+	struct nvmf_vfio_user_sq *vu_sq;
+	struct nvmf_vfio_user_cq *vu_cq;
+	struct vfio_user_delete_sq_ctx *ctx;
 
 	SPDK_DEBUGLOG(nvmf_vfio, "%s: delete I/O %cQ: QID=%d\n",
 		      ctrlr_id(ctrlr), is_cq ? 'C' : 'S',
@@ -1306,20 +1542,20 @@ handle_del_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 		goto out;
 	}
 
-	vu_qpair = ctrlr->qp[cmd->cdw10_bits.delete_io_q.qid];
 	if (is_cq) {
-		if (vu_qpair->state == VFIO_USER_QPAIR_UNINITIALIZED) {
-			free_qp(ctrlr, cmd->cdw10_bits.delete_io_q.qid);
-			goto out;
-		}
-
-		/* SQ must have been deleted first */
-		if (vu_qpair->state != VFIO_USER_QPAIR_SQ_DELETED) {
+		vu_cq = ctrlr->cqs[cmd->cdw10_bits.delete_io_q.qid];
+		if (vu_cq->cq_ref) {
 			SPDK_ERRLOG("%s: the associated SQ must be deleted first\n", ctrlr_id(ctrlr));
 			sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 			sc = SPDK_NVME_SC_INVALID_QUEUE_DELETION;
 			goto out;
 		}
+
+		unmap_q(ctrlr, &vu_cq->cq);
+		vu_cq->cq.size = 0;
+		vu_cq->cq_state = VFIO_USER_CQ_DELETED;
+		vu_cq->group = NULL;
+	} else {
 		ctx = calloc(1, sizeof(*ctx));
 		if (!ctx) {
 			sct = SPDK_NVME_SCT_GENERIC;
@@ -1327,30 +1563,19 @@ handle_del_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 			goto out;
 		}
 		ctx->vu_ctrlr = ctrlr;
-		ctx->delete_io_cq_cmd = *cmd;
-		spdk_nvmf_qpair_disconnect(&vu_qpair->qpair, vfio_user_qpair_delete_cb, ctx);
-		return 0;
-	} else {
-		if (vu_qpair->state == VFIO_USER_QPAIR_SQ_DELETED) {
-			SPDK_DEBUGLOG(nvmf_vfio, "%s: SQ%u is already deleted\n", ctrlr_id(ctrlr),
-				      cmd->cdw10_bits.delete_io_q.qid);
-			sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
-			sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
-			goto out;
-		}
+		ctx->delete_io_sq_cmd = *cmd;
 
-		/*
-		 * This doesn't actually delete the SQ, We're merely telling the poll_group_poll
-		 * function to skip checking this SQ.  The queue pair will be disconnected in Delete
-		 * IO CQ command.
-		 */
-		vu_qpair->state = VFIO_USER_QPAIR_SQ_DELETED;
-		vfu_unmap_sg(ctrlr->endpoint->vfu_ctx, vu_qpair->sq.sg, &vu_qpair->sq.iov, 1);
-		vu_qpair->sq.addr = NULL;
+		vu_sq = ctrlr->sqs[cmd->cdw10_bits.delete_io_q.qid];
+		vu_sq->sq_state = VFIO_USER_SQ_DELETED;
+		assert(ctrlr->cqs[vu_sq->sq.cqid]->cq_ref);
+		ctrlr->cqs[vu_sq->sq.cqid]->cq_ref--;
+
+		spdk_nvmf_qpair_disconnect(&vu_sq->qpair, vfio_user_qpair_delete_cb, ctx);
+		return 0;
 	}
 
 out:
-	return post_completion(ctrlr, &ctrlr->qp[0]->cq, 0, 0, cmd->cid, sc, sct);
+	return post_completion(ctrlr, ctrlr->cqs[0], 0, 0, cmd->cid, sc, sct);
 }
 
 /*
@@ -1364,7 +1589,7 @@ consume_admin_cmd(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 
 	if (cmd->fuse != 0) {
 		/* Fused admin commands are not supported. */
-		return post_completion(ctrlr, &ctrlr->qp[0]->cq, 0, 0, cmd->cid,
+		return post_completion(ctrlr, ctrlr->cqs[0], 0, 0, cmd->cid,
 				       SPDK_NVME_SC_INVALID_FIELD,
 				       SPDK_NVME_SCT_GENERIC);
 	}
@@ -1379,28 +1604,28 @@ consume_admin_cmd(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 		return handle_del_io_q(ctrlr, cmd,
 				       cmd->opc == SPDK_NVME_OPC_DELETE_IO_CQ);
 	default:
-		return handle_cmd_req(ctrlr, cmd, ctrlr->qp[0]);
+		return handle_cmd_req(ctrlr, cmd, ctrlr->sqs[0]);
 	}
 }
 
 static int
 handle_cmd_rsp(struct nvmf_vfio_user_req *vu_req, void *cb_arg)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair = cb_arg;
-	struct nvmf_vfio_user_ctrlr *vu_ctrlr = vu_qpair->ctrlr;
+	struct nvmf_vfio_user_sq *vu_sq = cb_arg;
+	struct nvmf_vfio_user_ctrlr *vu_ctrlr = vu_sq->ctrlr;
 	uint16_t sqid, cqid;
 
-	assert(vu_qpair != NULL);
+	assert(vu_sq != NULL);
 	assert(vu_req != NULL);
 	assert(vu_ctrlr != NULL);
 
 	if (spdk_likely(vu_req->iovcnt)) {
 		vfu_unmap_sg(vu_ctrlr->endpoint->vfu_ctx, vu_req->sg, vu_req->iov, vu_req->iovcnt);
 	}
-	sqid = vu_qpair->qpair.qid;
-	cqid = vu_ctrlr->qp[sqid]->sq.cqid;
+	sqid = vu_sq->sq.qid;
+	cqid = vu_sq->sq.cqid;
 
-	return post_completion(vu_ctrlr, &vu_ctrlr->qp[cqid]->cq,
+	return post_completion(vu_ctrlr, vu_ctrlr->cqs[cqid],
 			       vu_req->req.rsp->nvme_cpl.cdw0,
 			       sqid,
 			       vu_req->req.cmd->nvme_cmd.cid,
@@ -1409,32 +1634,32 @@ handle_cmd_rsp(struct nvmf_vfio_user_req *vu_req, void *cb_arg)
 }
 
 static int
-consume_cmd(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_qpair *qpair,
+consume_cmd(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_sq *vu_sq,
 	    struct spdk_nvme_cmd *cmd)
 {
-	assert(qpair != NULL);
-	if (nvmf_qpair_is_admin_queue(&qpair->qpair)) {
+	assert(vu_sq != NULL);
+	if (nvmf_qpair_is_admin_queue(&vu_sq->qpair)) {
 		return consume_admin_cmd(ctrlr, cmd);
 	}
 
-	return handle_cmd_req(ctrlr, cmd, qpair);
+	return handle_cmd_req(ctrlr, cmd, vu_sq);
 }
 
 /* Returns the number of commands processed, or a negative value on error. */
 static int
 handle_sq_tdbl_write(struct nvmf_vfio_user_ctrlr *ctrlr, const uint32_t new_tail,
-		     struct nvmf_vfio_user_qpair *qpair)
+		     struct nvmf_vfio_user_sq *vu_sq)
 {
 	struct spdk_nvme_cmd *queue;
 	int count = 0;
 
 	assert(ctrlr != NULL);
-	assert(qpair != NULL);
+	assert(vu_sq != NULL);
 
-	queue = qpair->sq.addr;
-	while (sq_head(qpair) != new_tail) {
+	queue = vu_sq->sq.addr;
+	while (sq_head(vu_sq) != new_tail) {
 		int err;
-		struct spdk_nvme_cmd *cmd = &queue[sq_head(qpair)];
+		struct spdk_nvme_cmd *cmd = &queue[sq_head(vu_sq)];
 
 		count++;
 
@@ -1442,9 +1667,9 @@ handle_sq_tdbl_write(struct nvmf_vfio_user_ctrlr *ctrlr, const uint32_t new_tail
 		 * SQHD must contain the new head pointer, so we must increase
 		 * it before we generate a completion.
 		 */
-		sqhd_advance(ctrlr, qpair);
+		sqhd_advance(ctrlr, vu_sq);
 
-		err = consume_cmd(ctrlr, qpair, cmd);
+		err = consume_cmd(ctrlr, vu_sq, cmd);
 		if (err != 0) {
 			return err;
 		}
@@ -1476,9 +1701,16 @@ enable_admin_queue(struct nvmf_vfio_user_ctrlr *ctrlr)
 static void
 disable_admin_queue(struct nvmf_vfio_user_ctrlr *ctrlr)
 {
-	assert(ctrlr->qp[0] != NULL);
+	assert(ctrlr->sqs[0] != NULL);
+	assert(ctrlr->cqs[0] != NULL);
 
-	unmap_qp(ctrlr->qp[0]);
+	unmap_q(ctrlr, &ctrlr->sqs[0]->sq);
+	unmap_q(ctrlr, &ctrlr->cqs[0]->cq);
+
+	ctrlr->sqs[0]->sq.size = 0;
+	ctrlr->sqs[0]->sq.head = 0;
+	ctrlr->cqs[0]->cq.size = 0;
+	ctrlr->cqs[0]->cq.tail = 0;
 }
 
 static void
@@ -1486,7 +1718,9 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
 	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
 	struct nvmf_vfio_user_ctrlr *ctrlr;
-	struct nvmf_vfio_user_qpair *qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
+	struct nvmf_vfio_user_cq *vu_cq;
+	struct nvme_q *sq, *cq;
 	int ret;
 
 	/*
@@ -1511,7 +1745,7 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 	}
 	ctrlr = endpoint->ctrlr;
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: map IOVA %#lx-%#lx\n", ctrlr_id(ctrlr),
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: map IOVA %#lx-%#lx\n", endpoint_id(endpoint),
 		      (uintptr_t)info->mapping.iov_base,
 		      (uintptr_t)info->mapping.iov_base + info->mapping.iov_len);
 
@@ -1522,101 +1756,113 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 		ret = spdk_mem_register(info->mapping.iov_base, info->mapping.iov_len);
 		if (ret) {
 			SPDK_ERRLOG("Memory region register %#lx-%#lx failed, ret=%d\n",
-				    (uint64_t)(uintptr_t)info->mapping.iov_base,
-				    (uint64_t)(uintptr_t)info->mapping.iov_base + info->mapping.iov_len,
+				    (uintptr_t)info->mapping.iov_base,
+				    (uintptr_t)info->mapping.iov_base + info->mapping.iov_len,
 				    ret);
 		}
 	}
 
 	pthread_mutex_lock(&endpoint->lock);
-	TAILQ_FOREACH(qpair, &ctrlr->connected_qps, tailq) {
-		if (qpair->state != VFIO_USER_QPAIR_INACTIVE) {
+	TAILQ_FOREACH(vu_sq, &ctrlr->connected_sqs, tailq) {
+		if (vu_sq->sq_state != VFIO_USER_SQ_INACTIVE) {
 			continue;
 		}
 
-		ret = remap_qp(qpair);
-		if (ret) {
-			continue;
+		vu_cq = ctrlr->cqs[vu_sq->sq.cqid];
+		cq = &vu_cq->cq;
+		sq = &vu_sq->sq;
+
+		/* For shared CQ case, we will use cq->addr to avoid mapping CQ multiple times */
+		if (cq->size && !cq->addr) {
+			ret = map_q(ctrlr, cq, true, false);
+			if (ret) {
+				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap CQID %d %#lx-%#lx\n",
+					      cq->cqid, cq->prp1, cq->prp1 + cq->size * sizeof(struct spdk_nvme_cpl));
+				continue;
+			}
 		}
-		qpair->state = VFIO_USER_QPAIR_ACTIVE;
-		SPDK_DEBUGLOG(nvmf_vfio, "Remap QP %u successfully\n", qpair->qpair.qid);
+
+		if (sq->size) {
+			ret = map_q(ctrlr, sq, false, false);
+			if (ret) {
+				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap SQID %d %#lx-%#lx\n",
+					      vu_sq->sq.qid, sq->prp1, sq->prp1 + sq->size * sizeof(struct spdk_nvme_cmd));
+				continue;
+			}
+		}
+		vu_sq->sq_state = VFIO_USER_SQ_ACTIVE;
+		SPDK_DEBUGLOG(nvmf_vfio, "Remap SQ %u successfully\n", vu_sq->sq.qid);
 	}
 	pthread_mutex_unlock(&endpoint->lock);
 }
 
-static int
+static void
 memory_region_remove_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
 	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
-	struct nvmf_vfio_user_ctrlr *ctrlr;
-	struct nvmf_vfio_user_qpair *qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
+	struct nvmf_vfio_user_cq *vu_cq;
 	void *map_start, *map_end;
 	int ret = 0;
 
 	if (!info->vaddr) {
-		return 0;
+		return;
 	}
-
-	if (((uintptr_t)info->mapping.iov_base & MASK_2MB) ||
-	    (info->mapping.iov_len & MASK_2MB)) {
-		SPDK_DEBUGLOG(nvmf_vfio, "Invalid memory region vaddr %p, IOVA %#lx-%#lx\n", info->vaddr,
-			      (uintptr_t)info->mapping.iov_base,
-			      (uintptr_t)info->mapping.iov_base + info->mapping.iov_len);
-		return 0;
-	}
-
-	assert(endpoint != NULL);
-	if (endpoint->ctrlr == NULL) {
-		return 0;
-	}
-	ctrlr = endpoint->ctrlr;
-
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: unmap IOVA %#lx-%#lx\n", ctrlr_id(ctrlr),
-		      (uintptr_t)info->mapping.iov_base,
-		      (uintptr_t)info->mapping.iov_base + info->mapping.iov_len);
 
 	map_start = info->mapping.iov_base;
 	map_end = info->mapping.iov_base + info->mapping.iov_len;
 
-	pthread_mutex_lock(&endpoint->lock);
-	TAILQ_FOREACH(qpair, &ctrlr->connected_qps, tailq) {
-		if ((qpair->cq.addr >= map_start && qpair->cq.addr <= map_end) ||
-		    (qpair->sq.addr >= map_start && qpair->sq.addr <= map_end)) {
-			/* TODO: Ideally we should disconnect this queue pair
-			 * before returning to caller.
-			 */
-			unmap_qp(qpair);
-			qpair->state = VFIO_USER_QPAIR_INACTIVE;
-		}
+	if (((uintptr_t)info->mapping.iov_base & MASK_2MB) ||
+	    (info->mapping.iov_len & MASK_2MB)) {
+		SPDK_DEBUGLOG(nvmf_vfio, "Invalid memory region vaddr %p, IOVA %#lx-%#lx\n", info->vaddr,
+			      (uintptr_t)map_start, (uintptr_t)map_end);
+		return;
 	}
-	pthread_mutex_unlock(&endpoint->lock);
+
+	assert(endpoint != NULL);
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: unmap IOVA %#lx-%#lx\n", endpoint_id(endpoint),
+		      (uintptr_t)map_start, (uintptr_t)map_end);
+
+	if (endpoint->ctrlr != NULL) {
+		struct nvmf_vfio_user_ctrlr *ctrlr;
+		ctrlr = endpoint->ctrlr;
+
+		pthread_mutex_lock(&endpoint->lock);
+		TAILQ_FOREACH(vu_sq, &ctrlr->connected_sqs, tailq) {
+			if (vu_sq->sq.addr >= map_start && vu_sq->sq.addr <= map_end) {
+				unmap_q(ctrlr, &vu_sq->sq);
+				vu_sq->sq_state = VFIO_USER_SQ_INACTIVE;
+			}
+
+			vu_cq = ctrlr->cqs[vu_sq->sq.cqid];
+			if (vu_cq->cq.addr >= map_start && vu_cq->cq.addr <= map_end) {
+				unmap_q(ctrlr, &vu_cq->cq);
+			}
+		}
+		pthread_mutex_unlock(&endpoint->lock);
+	}
 
 	if (info->prot == (PROT_WRITE | PROT_READ)) {
 		ret = spdk_mem_unregister(info->mapping.iov_base, info->mapping.iov_len);
 		if (ret) {
 			SPDK_ERRLOG("Memory region unregister %#lx-%#lx failed, ret=%d\n",
-				    (uint64_t)(uintptr_t)info->mapping.iov_base,
-				    (uint64_t)(uintptr_t)info->mapping.iov_base + info->mapping.iov_len,
-				    ret);
+				    (uintptr_t)map_start, (uintptr_t)map_end, ret);
 		}
 	}
-
-	return 0;
 }
 
 static int
 nvmf_vfio_user_prop_req_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair = cb_arg;
+	struct nvmf_vfio_user_sq *vu_sq = cb_arg;
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr;
-	bool disable_admin = false;
 	int ret;
 
-	assert(vu_qpair != NULL);
+	assert(vu_sq != NULL);
 	assert(req != NULL);
 
 	if (req->req.cmd->prop_get_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET) {
-		assert(vu_qpair->ctrlr != NULL);
+		assert(vu_sq->ctrlr != NULL);
 		assert(req != NULL);
 
 		memcpy(req->req.data,
@@ -1624,8 +1870,8 @@ nvmf_vfio_user_prop_req_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 		       req->req.length);
 	} else {
 		assert(req->req.cmd->prop_set_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET);
-		assert(vu_qpair->ctrlr != NULL);
-		vu_ctrlr = vu_qpair->ctrlr;
+		assert(vu_sq->ctrlr != NULL);
+		vu_ctrlr = vu_sq->ctrlr;
 
 		if (req->req.cmd->prop_set_cmd.ofst == offsetof(struct spdk_nvme_registers, cc)) {
 			union spdk_nvme_cc_register cc, diff;
@@ -1641,26 +1887,27 @@ nvmf_vfio_user_prop_req_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 						SPDK_ERRLOG("%s: failed to map Admin queue\n", ctrlr_id(vu_ctrlr));
 						return ret;
 					}
-					vu_qpair->state = VFIO_USER_QPAIR_ACTIVE;
+					vu_sq->sq_state = VFIO_USER_SQ_ACTIVE;
+					vu_ctrlr->reset_shn = false;
 				} else {
-					disable_admin = true;
+					vu_ctrlr->reset_shn = true;
 				}
 			}
 
 			if (diff.bits.shn) {
 				if (cc.bits.shn == SPDK_NVME_SHN_NORMAL || cc.bits.shn == SPDK_NVME_SHN_ABRUPT) {
-					disable_admin = true;
+					vu_ctrlr->reset_shn = true;
 				}
 			}
 
-			if (disable_admin) {
+			if (vu_ctrlr->reset_shn) {
 				SPDK_DEBUGLOG(nvmf_vfio,
 					      "%s: UNMAP Admin queue\n",
 					      ctrlr_id(vu_ctrlr));
-				vu_qpair->state = VFIO_USER_QPAIR_INACTIVE;
+				vu_sq->sq_state = VFIO_USER_SQ_INACTIVE;
 				disable_admin_queue(vu_ctrlr);
 				/* For PCIe controller reset or shutdown, we will drop all AER responses */
-				nvmf_ctrlr_abort_aer(vu_qpair->qpair.ctrlr);
+				nvmf_ctrlr_abort_aer(vu_ctrlr->ctrlr);
 			}
 		}
 	}
@@ -1728,6 +1975,10 @@ access_bar0_fn(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t pos,
 	int ret;
 
 	ctrlr = endpoint->ctrlr;
+	if (endpoint->need_async_destroy || !ctrlr) {
+		errno = EIO;
+		return -1;
+	}
 
 	SPDK_DEBUGLOG(nvmf_vfio,
 		      "%s: bar0 %s ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
@@ -1750,16 +2001,16 @@ access_bar0_fn(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t pos,
 	}
 
 	/* Construct a Fabric Property Get/Set command and send it */
-	req = get_nvmf_vfio_user_req(ctrlr->qp[0]);
+	req = get_nvmf_vfio_user_req(ctrlr->sqs[0]);
 	if (req == NULL) {
 		errno = ENOBUFS;
 		return -1;
 	}
-	regs = spdk_nvmf_ctrlr_get_regs(ctrlr->qp[0]->qpair.ctrlr);
+	regs = spdk_nvmf_ctrlr_get_regs(ctrlr->ctrlr);
 	req->cc.raw = regs->cc.raw;
 
 	req->cb_fn = nvmf_vfio_user_prop_req_rsp;
-	req->cb_arg = ctrlr->qp[0];
+	req->cb_arg = ctrlr->sqs[0];
 	req->req.cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
 	req->req.cmd->prop_set_cmd.cid = 0;
 	req->req.cmd->prop_set_cmd.attrib.size = (count / 4) - 1;
@@ -1859,6 +2110,315 @@ init_pci_config_space(vfu_pci_config_space_t *p)
 
 	/* enable INTx */
 	p->hdr.intr.ipin = 0x1;
+}
+
+static void
+vfio_user_dev_quiesce_done(struct spdk_nvmf_subsystem *subsystem,
+			   void *cb_arg, int status);
+
+static void
+vfio_user_dev_quiesce_resume_done(struct spdk_nvmf_subsystem *subsystem,
+				  void *cb_arg, int status)
+{
+	struct nvmf_vfio_user_ctrlr *vu_ctrlr = cb_arg;
+	struct nvmf_vfio_user_endpoint *endpoint = vu_ctrlr->endpoint;
+	int ret;
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s resumed done with status %d\n", ctrlr_id(vu_ctrlr), status);
+
+	vu_ctrlr->state = VFIO_USER_CTRLR_RUNNING;
+
+	/* Basically, once we call `vfu_device_quiesced` the device is unquiesced from
+	 * libvfio-user's perspective so from the moment `vfio_user_dev_quiesce_done` returns
+	 * libvfio-user might quiesce the device again. However, because the NVMf subsytem is
+	 * an asynchronous operation, this quiesce might come _before_ the NVMf subsystem has
+	 * been resumed, so in the callback of `spdk_nvmf_subsystem_resume` we need to check
+	 * whether a quiesce was requested.
+	 */
+	if (vu_ctrlr->queued_quiesce) {
+		SPDK_DEBUGLOG(nvmf_vfio, "%s has queued quiesce event, pause again\n", ctrlr_id(vu_ctrlr));
+		vu_ctrlr->state = VFIO_USER_CTRLR_PAUSING;
+		ret = spdk_nvmf_subsystem_pause((struct spdk_nvmf_subsystem *)endpoint->subsystem, 0,
+						vfio_user_dev_quiesce_done, vu_ctrlr);
+		if (ret < 0) {
+			vu_ctrlr->state = VFIO_USER_CTRLR_RUNNING;
+			SPDK_ERRLOG("%s: failed to pause, ret=%d\n", endpoint_id(endpoint), ret);
+		}
+	}
+}
+
+static void
+vfio_user_dev_quiesce_done(struct spdk_nvmf_subsystem *subsystem,
+			   void *cb_arg, int status)
+{
+	struct nvmf_vfio_user_ctrlr *vu_ctrlr = cb_arg;
+	struct nvmf_vfio_user_endpoint *endpoint = vu_ctrlr->endpoint;
+	int ret;
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s paused done with status %d\n", ctrlr_id(vu_ctrlr), status);
+
+	assert(vu_ctrlr->state == VFIO_USER_CTRLR_PAUSING);
+	vu_ctrlr->state = VFIO_USER_CTRLR_PAUSED;
+	vfu_device_quiesced(endpoint->vfu_ctx, status);
+	vu_ctrlr->queued_quiesce = false;
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s start to resume\n", ctrlr_id(vu_ctrlr));
+	vu_ctrlr->state = VFIO_USER_CTRLR_RESUMING;
+	ret = spdk_nvmf_subsystem_resume((struct spdk_nvmf_subsystem *)endpoint->subsystem,
+					 vfio_user_dev_quiesce_resume_done, vu_ctrlr);
+	if (ret < 0) {
+		vu_ctrlr->state = VFIO_USER_CTRLR_PAUSED;
+		SPDK_ERRLOG("%s: failed to resume, ret=%d\n", endpoint_id(endpoint), ret);
+	}
+}
+
+static int
+vfio_user_dev_quiesce_cb(vfu_ctx_t *vfu_ctx)
+{
+	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
+	struct nvmf_vfio_user_ctrlr *vu_ctrlr = endpoint->ctrlr;
+	int ret;
+
+	if (!vu_ctrlr) {
+		return 0;
+	}
+
+	/* NVMf library will destruct controller when no
+	 * connected queue pairs.
+	 */
+	if (!nvmf_subsystem_get_ctrlr((struct spdk_nvmf_subsystem *)endpoint->subsystem,
+				      vu_ctrlr->cntlid)) {
+		return 0;
+	}
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s starts to quiesce\n", ctrlr_id(vu_ctrlr));
+
+	/* There is no race condition here as device quiesce callback
+	 * and nvmf_prop_set_cc() are running in the same thread context.
+	 */
+	if (!vu_ctrlr->ctrlr->vcprop.cc.bits.en) {
+		return 0;
+	} else if (!vu_ctrlr->ctrlr->vcprop.csts.bits.rdy) {
+		return 0;
+	} else if (vu_ctrlr->ctrlr->vcprop.csts.bits.shst == SPDK_NVME_SHST_COMPLETE) {
+		return 0;
+	}
+
+	switch (vu_ctrlr->state) {
+	case VFIO_USER_CTRLR_PAUSED:
+		return 0;
+	case VFIO_USER_CTRLR_RUNNING:
+		vu_ctrlr->state = VFIO_USER_CTRLR_PAUSING;
+		ret = spdk_nvmf_subsystem_pause((struct spdk_nvmf_subsystem *)endpoint->subsystem, 0,
+						vfio_user_dev_quiesce_done, vu_ctrlr);
+		if (ret < 0) {
+			vu_ctrlr->state = VFIO_USER_CTRLR_RUNNING;
+			SPDK_ERRLOG("%s: failed to pause, ret=%d\n", endpoint_id(endpoint), ret);
+			return 0;
+		}
+		break;
+	case VFIO_USER_CTRLR_RESUMING:
+		vu_ctrlr->queued_quiesce = true;
+		SPDK_DEBUGLOG(nvmf_vfio, "%s is busy to quiesce, current state %u\n", ctrlr_id(vu_ctrlr),
+			      vu_ctrlr->state);
+		break;
+	default:
+		assert(vu_ctrlr->state != VFIO_USER_CTRLR_PAUSING);
+		break;
+	}
+
+	errno = EBUSY;
+	return -1;
+}
+
+static void
+vfio_user_ctrlr_dump_migr_data(const char *name, struct vfio_user_nvme_migr_state *migr_data)
+{
+	struct spdk_nvme_registers *regs;
+	struct nvme_migr_sq_state *sq;
+	struct nvme_migr_cq_state *cq;
+	uint32_t *doorbell_base;
+	uint32_t i;
+
+	SPDK_NOTICELOG("Dump %s\n", name);
+
+	regs = (struct spdk_nvme_registers *)migr_data->bar0;
+	doorbell_base = (uint32_t *)&regs->doorbell[0].sq_tdbl;
+
+	SPDK_NOTICELOG("Registers\n");
+	SPDK_NOTICELOG("CSTS 0x%x\n", regs->csts.raw);
+	SPDK_NOTICELOG("CAP  0x%"PRIx64"\n", regs->cap.raw);
+	SPDK_NOTICELOG("VS   0x%x\n", regs->vs.raw);
+	SPDK_NOTICELOG("CC   0x%x\n", regs->cc.raw);
+	SPDK_NOTICELOG("AQA  0x%x\n", regs->aqa.raw);
+	SPDK_NOTICELOG("ASQ  0x%"PRIx64"\n", regs->asq);
+	SPDK_NOTICELOG("ACQ  0x%"PRIx64"\n", regs->acq);
+
+	SPDK_NOTICELOG("Number of IO Queues %u\n", migr_data->ctrlr_data.num_io_queues);
+	for (i = 0; i < NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR; i++) {
+		sq = &migr_data->qps[i].sq;
+		cq = &migr_data->qps[i].cq;
+
+		if (sq->size) {
+			SPDK_NOTICELOG("SQID %u, SQ DOORBELL %u\n", sq->sqid, doorbell_base[i * 2]);
+			SPDK_NOTICELOG("SQ SQID %u, CQID %u, HEAD %u, SIZE %u, DMA ADDR 0x%"PRIx64"\n",
+				       sq->sqid, sq->cqid, sq->head, sq->size, sq->dma_addr);
+		}
+
+		if (cq->size) {
+			SPDK_NOTICELOG("CQID %u, CQ DOORBELL %u\n", cq->cqid, doorbell_base[i * 2 + 1]);
+			SPDK_NOTICELOG("CQ CQID %u, PHASE %u, TAIL %u, SIZE %u, IV %u, IEN %u, DMA ADDR 0x%"PRIx64"\n",
+				       cq->cqid, cq->phase, cq->tail, cq->size, cq->iv, cq->ien, cq->dma_addr);
+		}
+	}
+
+	SPDK_NOTICELOG("%s Dump Done\n", name);
+}
+
+static __attribute__((unused)) int
+vfio_user_migr_stream_to_data(struct nvmf_vfio_user_endpoint *endpoint,
+			      struct vfio_user_nvme_migr_state *migr_state)
+{
+	void *data_ptr = endpoint->migr_data;
+
+	/* Load nvme_migr_device_state first */
+	memcpy(&migr_state->ctrlr_data, data_ptr, sizeof(struct nvme_migr_device_state));
+	/* TODO: version check */
+	if (migr_state->ctrlr_data.magic != VFIO_USER_NVME_MIGR_MAGIC) {
+		SPDK_ERRLOG("%s: bad magic number %x\n", endpoint_id(endpoint), migr_state->ctrlr_data.magic);
+		return -EINVAL;
+	}
+
+	/* Load private controller data */
+	data_ptr = endpoint->migr_data + migr_state->ctrlr_data.private_data_offset;
+	memcpy(&migr_state->private_data, data_ptr, migr_state->ctrlr_data.private_data_len);
+
+	/* Load queue pairs */
+	data_ptr = endpoint->migr_data + migr_state->ctrlr_data.qp_offset;
+	memcpy(&migr_state->qps, data_ptr, migr_state->ctrlr_data.qp_len);
+
+	/* Load BAR0 */
+	data_ptr = endpoint->migr_data + migr_state->ctrlr_data.bar_offset[VFU_PCI_DEV_BAR0_REGION_IDX];
+	memcpy(&migr_state->bar0, data_ptr, migr_state->ctrlr_data.bar_len[VFU_PCI_DEV_BAR0_REGION_IDX]);
+
+	/* Load CFG */
+	data_ptr = endpoint->migr_data + migr_state->ctrlr_data.bar_offset[VFU_PCI_DEV_CFG_REGION_IDX];
+	memcpy(&migr_state->cfg, data_ptr, migr_state->ctrlr_data.bar_len[VFU_PCI_DEV_CFG_REGION_IDX]);
+
+	return 0;
+}
+
+static __attribute__((unused)) void
+vfio_user_migr_ctrlr_save_data(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
+{
+	struct spdk_nvmf_ctrlr *ctrlr = vu_ctrlr->ctrlr;
+	struct nvmf_vfio_user_endpoint *endpoint = vu_ctrlr->endpoint;
+	struct nvmf_vfio_user_sq *vu_sq;
+	struct nvmf_vfio_user_cq *vu_cq;
+	struct vfio_user_nvme_migr_state migr_state = {};
+	uint64_t data_offset;
+	void *data_ptr;
+	int num_aers;
+	struct spdk_nvme_registers *regs;
+	uint32_t *doorbell_base;
+	uint32_t i = 0;
+	uint16_t sqid, cqid;
+
+	/* Save all data to vfio_user_nvme_migr_state first, then we will
+	 * copy it to device migration region at last.
+	 */
+
+	/* save magic number */
+	migr_state.ctrlr_data.magic = VFIO_USER_NVME_MIGR_MAGIC;
+
+	/* save controller data */
+	num_aers = nvmf_ctrlr_save_aers(ctrlr, migr_state.ctrlr_data.aer_cids,
+					256);
+	assert(num_aers >= 0);
+	migr_state.ctrlr_data.nr_aers = num_aers;
+
+	/* save controller private data */
+	nvmf_ctrlr_save_migr_data(ctrlr, (struct nvmf_ctrlr_migr_data *)&migr_state.private_data);
+
+	/* save queue pairs */
+	TAILQ_FOREACH(vu_sq, &vu_ctrlr->connected_sqs, tailq) {
+		/* save sq */
+		sqid = vu_sq->sq.qid;
+		migr_state.qps[sqid].sq.sqid = vu_sq->sq.qid;
+		migr_state.qps[sqid].sq.cqid = vu_sq->sq.cqid;
+		migr_state.qps[sqid].sq.head = vu_sq->sq.head;
+		migr_state.qps[sqid].sq.size = vu_sq->sq.size;
+		migr_state.qps[sqid].sq.dma_addr = vu_sq->sq.prp1;
+
+		/* save cq, for shared cq case, cq may be saved multiple times */
+		cqid = vu_sq->sq.cqid;
+		vu_cq = vu_ctrlr->cqs[cqid];
+		migr_state.qps[cqid].cq.cqid = cqid;
+		migr_state.qps[cqid].cq.tail = vu_cq->cq.tail;
+		migr_state.qps[cqid].cq.ien = vu_cq->cq.ien;
+		migr_state.qps[cqid].cq.iv = vu_cq->cq.iv;
+		migr_state.qps[cqid].cq.size = vu_cq->cq.size;
+		migr_state.qps[cqid].cq.phase = vu_cq->cq.phase;
+		migr_state.qps[cqid].cq.dma_addr = vu_cq->cq.prp1;
+		i++;
+	}
+
+	assert(i > 0);
+	migr_state.ctrlr_data.num_io_queues = i - 1;
+
+	regs = (struct spdk_nvme_registers *)&migr_state.bar0;
+	/* Save mandarory registers to bar0 */
+	regs->cap.raw = ctrlr->vcprop.cap.raw;
+	regs->vs.raw = ctrlr->vcprop.vs.raw;
+	regs->cc.raw = ctrlr->vcprop.cc.raw;
+	regs->aqa.raw = ctrlr->vcprop.aqa.raw;
+	regs->asq = ctrlr->vcprop.asq;
+	regs->acq = ctrlr->vcprop.acq;
+	/* Save doorbells */
+	doorbell_base = (uint32_t *)&regs->doorbell[0].sq_tdbl;
+	memcpy(doorbell_base, (void *)vu_ctrlr->doorbells, NVMF_VFIO_USER_DOORBELLS_SIZE);
+
+	/* Save PCI configuration space */
+	memcpy(&migr_state.cfg, (void *)endpoint->pci_config_space, NVME_REG_CFG_SIZE);
+
+	/* Save all data to device migration region */
+	data_ptr = endpoint->migr_data;
+
+	/* Copy private controller data */
+	data_offset = sizeof(struct nvme_migr_device_state);
+	data_ptr += data_offset;
+	migr_state.ctrlr_data.private_data_offset = data_offset;
+	migr_state.ctrlr_data.private_data_len = sizeof(struct nvmf_ctrlr_migr_data);
+	memcpy(data_ptr, &migr_state.private_data, sizeof(struct nvmf_ctrlr_migr_data));
+
+	/* Copy queue pairs */
+	data_offset += sizeof(struct nvmf_ctrlr_migr_data);
+	data_ptr += sizeof(struct nvmf_ctrlr_migr_data);
+	migr_state.ctrlr_data.qp_offset = data_offset;
+	migr_state.ctrlr_data.qp_len = i * (sizeof(struct nvme_migr_sq_state) + sizeof(
+			struct nvme_migr_cq_state));
+	memcpy(data_ptr, &migr_state.qps, migr_state.ctrlr_data.qp_len);
+
+	/* Copy BAR0 */
+	data_offset += migr_state.ctrlr_data.qp_len;
+	data_ptr += migr_state.ctrlr_data.qp_len;
+	migr_state.ctrlr_data.bar_offset[VFU_PCI_DEV_BAR0_REGION_IDX] = data_offset;
+	migr_state.ctrlr_data.bar_len[VFU_PCI_DEV_BAR0_REGION_IDX] = NVME_REG_BAR0_SIZE;
+	memcpy(data_ptr, &migr_state.bar0, NVME_REG_BAR0_SIZE);
+
+	/* Copy CFG */
+	data_offset += NVME_REG_BAR0_SIZE;
+	data_ptr += NVME_REG_BAR0_SIZE;
+	migr_state.ctrlr_data.bar_offset[VFU_PCI_DEV_CFG_REGION_IDX] = data_offset;
+	migr_state.ctrlr_data.bar_len[VFU_PCI_DEV_CFG_REGION_IDX] = NVME_REG_CFG_SIZE;
+	memcpy(data_ptr, &migr_state.cfg, NVME_REG_CFG_SIZE);
+
+	/* Copy device state finally */
+	memcpy(endpoint->migr_data, &migr_state.ctrlr_data, sizeof(struct nvme_migr_device_state));
+
+	if (SPDK_DEBUGLOG_FLAG_ENABLED("nvmf_vfio")) {
+		vfio_user_ctrlr_dump_migr_data("SAVE", &migr_state);
+	}
 }
 
 static int
@@ -1976,6 +2536,8 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_transport *vu_transport,
 		return ret;
 	}
 
+	vfu_setup_device_quiesce_cb(vfu_ctx, vfio_user_dev_quiesce_cb);
+
 	ret = vfu_realize_ctx(vfu_ctx);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to realize\n", vfu_ctx);
@@ -1996,23 +2558,26 @@ static void
 _free_ctrlr(void *ctx)
 {
 	struct nvmf_vfio_user_ctrlr *ctrlr = ctx;
+	struct nvmf_vfio_user_endpoint *endpoint = ctrlr->endpoint;
 
 	spdk_poller_unregister(&ctrlr->vfu_ctx_poller);
 	free(ctrlr);
+
+	if (endpoint && endpoint->need_async_destroy) {
+		nvmf_vfio_user_destroy_endpoint(endpoint);
+	}
 }
 
 static void
-free_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr, bool free_qps)
+free_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr)
 {
 	int i;
 	assert(ctrlr != NULL);
 
 	SPDK_DEBUGLOG(nvmf_vfio, "free %s\n", ctrlr_id(ctrlr));
 
-	if (free_qps) {
-		for (i = 0; i < NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR; i++) {
-			free_qp(ctrlr, i);
-		}
+	for (i = 0; i < NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR; i++) {
+		free_qp(ctrlr, i);
 	}
 
 	if (ctrlr->thread == spdk_get_thread()) {
@@ -2040,10 +2605,22 @@ nvmf_vfio_user_create_ctrlr(struct nvmf_vfio_user_transport *transport,
 	ctrlr->transport = transport;
 	ctrlr->endpoint = endpoint;
 	ctrlr->doorbells = endpoint->doorbells;
-	TAILQ_INIT(&ctrlr->connected_qps);
+	TAILQ_INIT(&ctrlr->connected_sqs);
 
 	/* Then, construct an admin queue pair */
-	err = init_qp(ctrlr, &transport->transport, NVMF_VFIO_USER_DEFAULT_AQ_DEPTH, 0);
+	err = init_sq(ctrlr, &transport->transport, 0);
+	if (err != 0) {
+		free(ctrlr);
+		goto out;
+	}
+
+	err = init_cq(ctrlr, 0);
+	if (err != 0) {
+		free(ctrlr);
+		goto out;
+	}
+
+	err = alloc_sq_reqs(ctrlr, ctrlr->sqs[0], NVMF_VFIO_USER_DEFAULT_AQ_DEPTH);
 	if (err != 0) {
 		free(ctrlr);
 		goto out;
@@ -2051,7 +2628,7 @@ nvmf_vfio_user_create_ctrlr(struct nvmf_vfio_user_transport *transport,
 	endpoint->ctrlr = ctrlr;
 
 	/* Notify the generic layer about the new admin queue pair */
-	spdk_nvmf_tgt_new_qpair(transport->transport.tgt, &ctrlr->qp[0]->qpair);
+	spdk_nvmf_tgt_new_qpair(transport->transport.tgt, &ctrlr->sqs[0]->qpair);
 
 out:
 	if (err != 0) {
@@ -2125,12 +2702,45 @@ nvmf_vfio_user_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
+	ret = snprintf(path, PATH_MAX, "%s/migr", endpoint_id(endpoint));
+	if (ret < 0 || ret >= PATH_MAX) {
+		SPDK_ERRLOG("%s: error to get migration file path: %s.\n", endpoint_id(endpoint),
+			    spdk_strerror(errno));
+		ret = -1;
+		goto out;
+	}
+	ret = open(path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+	if (ret == -1) {
+		SPDK_ERRLOG("%s: failed to open device memory at %s: %s.\n",
+			    endpoint_id(endpoint), path, spdk_strerror(errno));
+		goto out;
+	}
+
+	endpoint->migr_fd = ret;
+	ret = ftruncate(endpoint->migr_fd,
+			vfu_get_migr_register_area_size() + vfio_user_migr_data_len());
+	if (ret != 0) {
+		SPDK_ERRLOG("%s: error to ftruncate migration file %s: %s.\n", endpoint_id(endpoint), path,
+			    spdk_strerror(errno));
+		goto out;
+	}
+
+	endpoint->migr_data = mmap(NULL, vfio_user_migr_data_len(),
+				   PROT_READ | PROT_WRITE, MAP_SHARED, endpoint->migr_fd, vfu_get_migr_register_area_size());
+	if (endpoint->migr_data == MAP_FAILED) {
+		SPDK_ERRLOG("%s: error to mmap file %s: %s.\n", endpoint_id(endpoint), path, spdk_strerror(errno));
+		endpoint->migr_data = NULL;
+		ret = -1;
+		goto out;
+	}
+
 	ret = snprintf(uuid, PATH_MAX, "%s/cntrl", endpoint_id(endpoint));
 	if (ret < 0 || ret >= PATH_MAX) {
 		SPDK_ERRLOG("%s: error to get ctrlr file path: %s\n", endpoint_id(endpoint), spdk_strerror(errno));
 		ret = -1;
 		goto out;
 	}
+
 	endpoint->vfu_ctx = vfu_create_ctx(VFU_TRANS_SOCK, uuid, LIBVFIO_USER_FLAG_ATTACH_NB,
 					   endpoint, VFU_DEV_TYPE_PCI);
 	if (endpoint->vfu_ctx == NULL) {
@@ -2146,7 +2756,10 @@ nvmf_vfio_user_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
+	pthread_mutex_lock(&vu_transport->lock);
 	TAILQ_INSERT_TAIL(&vu_transport->endpoints, endpoint, link);
+	pthread_mutex_unlock(&vu_transport->lock);
+
 	SPDK_DEBUGLOG(nvmf_vfio, "%s: doorbells %p\n", uuid, endpoint->doorbells);
 
 out:
@@ -2176,15 +2789,21 @@ nvmf_vfio_user_stop_listen(struct spdk_nvmf_transport *transport,
 	TAILQ_FOREACH_SAFE(endpoint, &vu_transport->endpoints, link, tmp) {
 		if (strcmp(trid->traddr, endpoint->trid.traddr) == 0) {
 			TAILQ_REMOVE(&vu_transport->endpoints, endpoint, link);
+			/* Defer to free endpoint resources until the controller
+			 * is freed.  There are two cases when running here:
+			 * 1. kill nvmf target while VM is connected
+			 * 2. remove listener via RPC call
+			 * nvmf library will disconnect all queue paris.
+			 */
 			if (endpoint->ctrlr) {
-				/* Users may kill NVMeoF target while VM
-				 * is connected, free all resources.
-				 */
-				free_ctrlr(endpoint->ctrlr, true);
+				assert(!endpoint->need_async_destroy);
+				endpoint->need_async_destroy = true;
+				pthread_mutex_unlock(&vu_transport->lock);
+				return;
 			}
+
 			nvmf_vfio_user_destroy_endpoint(endpoint);
 			pthread_mutex_unlock(&vu_transport->lock);
-
 			return;
 		}
 	}
@@ -2219,11 +2838,13 @@ nvmf_vfio_user_listen_associate(struct spdk_nvmf_transport *transport,
 
 	vu_transport = SPDK_CONTAINEROF(transport, struct nvmf_vfio_user_transport, transport);
 
+	pthread_mutex_lock(&vu_transport->lock);
 	TAILQ_FOREACH(endpoint, &vu_transport->endpoints, link) {
 		if (strncmp(endpoint->trid.traddr, trid->traddr, sizeof(endpoint->trid.traddr)) == 0) {
 			break;
 		}
 	}
+	pthread_mutex_unlock(&vu_transport->lock);
 
 	if (endpoint == NULL) {
 		return -ENOENT;
@@ -2294,6 +2915,7 @@ nvmf_vfio_user_discover(struct spdk_nvmf_transport *transport,
 static struct spdk_nvmf_transport_poll_group *
 nvmf_vfio_user_poll_group_create(struct spdk_nvmf_transport *transport)
 {
+	struct nvmf_vfio_user_transport *vu_transport;
 	struct nvmf_vfio_user_poll_group *vu_group;
 
 	SPDK_DEBUGLOG(nvmf_vfio, "create poll group\n");
@@ -2304,61 +2926,106 @@ nvmf_vfio_user_poll_group_create(struct spdk_nvmf_transport *transport)
 		return NULL;
 	}
 
-	TAILQ_INIT(&vu_group->qps);
+	TAILQ_INIT(&vu_group->sqs);
+
+	vu_transport = SPDK_CONTAINEROF(transport, struct nvmf_vfio_user_transport,
+					transport);
+	pthread_mutex_lock(&vu_transport->pg_lock);
+	TAILQ_INSERT_TAIL(&vu_transport->poll_groups, vu_group, link);
+	if (vu_transport->next_pg == NULL) {
+		vu_transport->next_pg = vu_group;
+	}
+	pthread_mutex_unlock(&vu_transport->pg_lock);
 
 	return &vu_group->group;
+}
+
+static struct spdk_nvmf_transport_poll_group *
+nvmf_vfio_user_get_optimal_poll_group(struct spdk_nvmf_qpair *qpair)
+{
+	struct nvmf_vfio_user_transport *vu_transport;
+	struct nvmf_vfio_user_poll_group **vu_group;
+	struct nvmf_vfio_user_sq *vu_sq;
+	struct nvmf_vfio_user_cq *vu_cq;
+
+	struct spdk_nvmf_transport_poll_group *result;
+
+	vu_sq = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_sq, qpair);
+	vu_cq = vu_sq->ctrlr->cqs[vu_sq->sq.cqid];
+	assert(vu_cq != NULL);
+	vu_transport = SPDK_CONTAINEROF(qpair->transport, struct nvmf_vfio_user_transport, transport);
+
+	pthread_mutex_lock(&vu_transport->pg_lock);
+	if (TAILQ_EMPTY(&vu_transport->poll_groups)) {
+		pthread_mutex_unlock(&vu_transport->pg_lock);
+		return NULL;
+	}
+
+	/* If this is shared IO CQ case, just return the used CQ's poll group */
+	if (!nvmf_qpair_is_admin_queue(qpair)) {
+		if (vu_cq->group) {
+			pthread_mutex_unlock(&vu_transport->pg_lock);
+			return vu_cq->group;
+		}
+	}
+
+	vu_group = &vu_transport->next_pg;
+	assert(*vu_group != NULL);
+
+	result = &(*vu_group)->group;
+	*vu_group = TAILQ_NEXT(*vu_group, link);
+	if (*vu_group == NULL) {
+		*vu_group = TAILQ_FIRST(&vu_transport->poll_groups);
+	}
+
+	if (vu_cq->group == NULL) {
+		vu_cq->group = result;
+	}
+
+	pthread_mutex_unlock(&vu_transport->pg_lock);
+	return result;
 }
 
 /* called when process exits */
 static void
 nvmf_vfio_user_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 {
-	struct nvmf_vfio_user_poll_group *vu_group;
+	struct nvmf_vfio_user_poll_group *vu_group, *next_tgroup;;
+	struct nvmf_vfio_user_transport *vu_transport;
 
 	SPDK_DEBUGLOG(nvmf_vfio, "destroy poll group\n");
 
 	vu_group = SPDK_CONTAINEROF(group, struct nvmf_vfio_user_poll_group, group);
+	vu_transport = SPDK_CONTAINEROF(vu_group->group.transport, struct nvmf_vfio_user_transport,
+					transport);
+
+	pthread_mutex_lock(&vu_transport->pg_lock);
+	next_tgroup = TAILQ_NEXT(vu_group, link);
+	TAILQ_REMOVE(&vu_transport->poll_groups, vu_group, link);
+	if (next_tgroup == NULL) {
+		next_tgroup = TAILQ_FIRST(&vu_transport->poll_groups);
+	}
+	if (vu_transport->next_pg == vu_group) {
+		vu_transport->next_pg = next_tgroup;
+	}
+	pthread_mutex_unlock(&vu_transport->pg_lock);
 
 	free(vu_group);
 }
 
 static void
-vfio_user_qpair_disconnect_cb(void *ctx)
-{
-	struct nvmf_vfio_user_endpoint *endpoint = ctx;
-	struct nvmf_vfio_user_ctrlr *ctrlr;
-
-	pthread_mutex_lock(&endpoint->lock);
-	ctrlr = endpoint->ctrlr;
-	if (!ctrlr) {
-		pthread_mutex_unlock(&endpoint->lock);
-		return;
-	}
-
-	if (TAILQ_EMPTY(&ctrlr->connected_qps)) {
-		endpoint->ctrlr = NULL;
-		free_ctrlr(ctrlr, false);
-	}
-	pthread_mutex_unlock(&endpoint->lock);
-}
-
-static void
 _vfio_user_qpair_disconnect(void *ctx)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair = ctx;
-	struct nvmf_vfio_user_ctrlr *vu_ctrlr;
-	struct nvmf_vfio_user_endpoint *endpoint;
+	struct nvmf_vfio_user_sq *vu_sq = ctx;
 
-	vu_ctrlr = vu_qpair->ctrlr;
-	endpoint = vu_ctrlr->endpoint;
-
-	spdk_nvmf_qpair_disconnect(&vu_qpair->qpair, vfio_user_qpair_disconnect_cb, endpoint);
+	spdk_nvmf_qpair_disconnect(&vu_sq->qpair, NULL, NULL);
 }
 
+/* The function is used when socket connection is destroyed */
 static int
 vfio_user_destroy_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr)
 {
-	struct nvmf_vfio_user_qpair *qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
 	struct nvmf_vfio_user_endpoint *endpoint;
 
 	SPDK_DEBUGLOG(nvmf_vfio, "%s stop processing\n", ctrlr_id(ctrlr));
@@ -2367,16 +3034,16 @@ vfio_user_destroy_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr)
 	assert(endpoint != NULL);
 
 	pthread_mutex_lock(&endpoint->lock);
-	if (TAILQ_EMPTY(&ctrlr->connected_qps)) {
+	if (TAILQ_EMPTY(&ctrlr->connected_sqs)) {
 		endpoint->ctrlr = NULL;
-		free_ctrlr(ctrlr, false);
+		free_ctrlr(ctrlr);
 		pthread_mutex_unlock(&endpoint->lock);
 		return 0;
 	}
 
-	TAILQ_FOREACH(qpair, &ctrlr->connected_qps, tailq) {
+	TAILQ_FOREACH(vu_sq, &ctrlr->connected_sqs, tailq) {
 		/* add another round thread poll to avoid recursive endpoint lock */
-		spdk_thread_send_msg(ctrlr->thread, _vfio_user_qpair_disconnect, qpair);
+		spdk_thread_send_msg(ctrlr->thread, _vfio_user_qpair_disconnect, vu_sq);
 	}
 	pthread_mutex_unlock(&endpoint->lock);
 
@@ -2416,18 +3083,35 @@ vfio_user_poll_vfu_ctx(void *ctx)
 	return ret != 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
+struct vfio_user_post_cpl_ctx {
+	struct nvmf_vfio_user_ctrlr	*ctrlr;
+	struct nvmf_vfio_user_cq	*cq;
+	struct spdk_nvme_cpl		cpl;
+};
+
+static void
+_post_completion_msg(void *ctx)
+{
+	struct vfio_user_post_cpl_ctx *cpl_ctx = ctx;
+
+	post_completion(cpl_ctx->ctrlr, cpl_ctx->cq, cpl_ctx->cpl.cdw0, cpl_ctx->cpl.sqid,
+			cpl_ctx->cpl.cid, cpl_ctx->cpl.status.sc, cpl_ctx->cpl.status.sct);
+	free(cpl_ctx);
+}
+
 static int
 handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 {
 	struct nvmf_vfio_user_poll_group *vu_group;
-	struct nvmf_vfio_user_qpair *vu_qpair = cb_arg;
+	struct nvmf_vfio_user_sq *vu_sq = cb_arg;
+	struct nvmf_vfio_user_cq *vu_cq;
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr;
 	struct nvmf_vfio_user_endpoint *endpoint;
 
-	assert(vu_qpair != NULL);
+	assert(vu_sq != NULL);
 	assert(req != NULL);
 
-	vu_ctrlr = vu_qpair->ctrlr;
+	vu_ctrlr = vu_sq->ctrlr;
 	assert(vu_ctrlr != NULL);
 	endpoint = vu_ctrlr->endpoint;
 	assert(endpoint != NULL);
@@ -2435,29 +3119,57 @@ handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 	if (spdk_nvme_cpl_is_error(&req->req.rsp->nvme_cpl)) {
 		SPDK_ERRLOG("SC %u, SCT %u\n", req->req.rsp->nvme_cpl.status.sc, req->req.rsp->nvme_cpl.status.sct);
 		endpoint->ctrlr = NULL;
-		free_ctrlr(vu_ctrlr, true);
+		free_ctrlr(vu_ctrlr);
 		return -1;
 	}
 
-	vu_group = SPDK_CONTAINEROF(vu_qpair->group, struct nvmf_vfio_user_poll_group, group);
-	TAILQ_INSERT_TAIL(&vu_group->qps, vu_qpair, link);
-	vu_qpair->state = VFIO_USER_QPAIR_ACTIVE;
+	vu_group = SPDK_CONTAINEROF(vu_sq->group, struct nvmf_vfio_user_poll_group, group);
+	TAILQ_INSERT_TAIL(&vu_group->sqs, vu_sq, link);
+
+	vu_cq = vu_ctrlr->cqs[0];
+	assert(vu_cq != NULL);
 
 	pthread_mutex_lock(&endpoint->lock);
-	if (nvmf_qpair_is_admin_queue(&vu_qpair->qpair)) {
-		vu_ctrlr->cntlid = vu_qpair->qpair.ctrlr->cntlid;
+	if (nvmf_qpair_is_admin_queue(&vu_sq->qpair)) {
+		vu_ctrlr->cntlid = vu_sq->qpair.ctrlr->cntlid;
 		vu_ctrlr->thread = spdk_get_thread();
-		vu_ctrlr->ctrlr = vu_qpair->qpair.ctrlr;
+		vu_ctrlr->ctrlr = vu_sq->qpair.ctrlr;
+		vu_ctrlr->state = VFIO_USER_CTRLR_RUNNING;
 		vu_ctrlr->vfu_ctx_poller = SPDK_POLLER_REGISTER(vfio_user_poll_vfu_ctx, vu_ctrlr, 0);
+		vu_cq->thread = spdk_get_thread();
 	} else {
 		/* For I/O queues this command was generated in response to an
 		 * ADMIN I/O CREATE SUBMISSION QUEUE command which has not yet
 		 * been completed. Complete it now.
 		 */
-		post_completion(vu_ctrlr, &vu_ctrlr->qp[0]->cq, 0, 0,
-				vu_qpair->create_io_sq_cmd.cid, SPDK_NVME_SC_SUCCESS, SPDK_NVME_SCT_GENERIC);
+		if (vu_sq->post_create_io_sq_completion) {
+			assert(vu_cq->thread != NULL);
+			if (vu_cq->thread != spdk_get_thread()) {
+				struct vfio_user_post_cpl_ctx *cpl_ctx;
+
+				cpl_ctx = calloc(1, sizeof(*cpl_ctx));
+				if (!cpl_ctx) {
+					return -ENOMEM;
+				}
+				cpl_ctx->ctrlr = vu_ctrlr;
+				cpl_ctx->cq = vu_cq;
+				cpl_ctx->cpl.sqid = 0;
+				cpl_ctx->cpl.cdw0 = 0;
+				cpl_ctx->cpl.cid = vu_sq->create_io_sq_cmd.cid;
+				cpl_ctx->cpl.status.sc = SPDK_NVME_SC_SUCCESS;
+				cpl_ctx->cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+
+				spdk_thread_send_msg(vu_cq->thread, _post_completion_msg, cpl_ctx);
+			} else {
+				post_completion(vu_ctrlr, vu_cq, 0, 0,
+						vu_sq->create_io_sq_cmd.cid, SPDK_NVME_SC_SUCCESS, SPDK_NVME_SCT_GENERIC);
+			}
+			vu_sq->post_create_io_sq_completion = false;
+		}
+		vu_sq->sq_state = VFIO_USER_SQ_ACTIVE;
 	}
-	TAILQ_INSERT_TAIL(&vu_ctrlr->connected_qps, vu_qpair, tailq);
+
+	TAILQ_INSERT_TAIL(&vu_ctrlr->connected_sqs, vu_sq, tailq);
 	pthread_mutex_unlock(&endpoint->lock);
 
 	free(req->req.data);
@@ -2475,24 +3187,24 @@ static int
 nvmf_vfio_user_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 			      struct spdk_nvmf_qpair *qpair)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
 	struct nvmf_vfio_user_req *vu_req;
 	struct nvmf_vfio_user_ctrlr *ctrlr;
 	struct spdk_nvmf_request *req;
 	struct spdk_nvmf_fabric_connect_data *data;
 	bool admin;
 
-	vu_qpair = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_qpair, qpair);
-	vu_qpair->group = group;
-	ctrlr = vu_qpair->ctrlr;
+	vu_sq = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_sq, qpair);
+	vu_sq->group = group;
+	ctrlr = vu_sq->ctrlr;
 
 	SPDK_DEBUGLOG(nvmf_vfio, "%s: add QP%d=%p(%p) to poll_group=%p\n",
-		      ctrlr_id(ctrlr), vu_qpair->qpair.qid,
-		      vu_qpair, qpair, group);
+		      ctrlr_id(ctrlr), vu_sq->qpair.qid,
+		      vu_sq, qpair, group);
 
-	admin = nvmf_qpair_is_admin_queue(&vu_qpair->qpair);
+	admin = nvmf_qpair_is_admin_queue(&vu_sq->qpair);
 
-	vu_req = get_nvmf_vfio_user_req(vu_qpair);
+	vu_req = get_nvmf_vfio_user_req(vu_sq);
 	if (vu_req == NULL) {
 		return -1;
 	}
@@ -2502,7 +3214,7 @@ nvmf_vfio_user_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	req->cmd->connect_cmd.cid = 0;
 	req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
 	req->cmd->connect_cmd.recfmt = 0;
-	req->cmd->connect_cmd.sqsize = vu_qpair->qsize - 1;
+	req->cmd->connect_cmd.sqsize = vu_sq->qsize - 1;
 	req->cmd->connect_cmd.qid = admin ? 0 : qpair->qid;
 
 	req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
@@ -2518,7 +3230,7 @@ nvmf_vfio_user_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 		 spdk_nvmf_subsystem_get_nqn(ctrlr->endpoint->subsystem));
 
 	vu_req->cb_fn = handle_queue_connect_rsp;
-	vu_req->cb_arg = vu_qpair;
+	vu_req->cb_arg = vu_sq;
 
 	SPDK_DEBUGLOG(nvmf_vfio,
 		      "%s: sending connect fabrics command for QID=%#x cntlid=%#x\n",
@@ -2532,45 +3244,45 @@ static int
 nvmf_vfio_user_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 				 struct spdk_nvmf_qpair *qpair)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
 	struct nvmf_vfio_user_poll_group *vu_group;
 
-	vu_qpair = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_qpair, qpair);
+	vu_sq = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_sq, qpair);
 
 	SPDK_DEBUGLOG(nvmf_vfio,
 		      "%s: remove NVMf QP%d=%p from NVMf poll_group=%p\n",
-		      ctrlr_id(vu_qpair->ctrlr), qpair->qid, qpair, group);
+		      ctrlr_id(vu_sq->ctrlr), qpair->qid, qpair, group);
 
 
 	vu_group = SPDK_CONTAINEROF(group, struct nvmf_vfio_user_poll_group, group);
-	TAILQ_REMOVE(&vu_group->qps, vu_qpair, link);
+	TAILQ_REMOVE(&vu_group->sqs, vu_sq, link);
 
 	return 0;
 }
 
 static void
-_nvmf_vfio_user_req_free(struct nvmf_vfio_user_qpair *vu_qpair, struct nvmf_vfio_user_req *vu_req)
+_nvmf_vfio_user_req_free(struct nvmf_vfio_user_sq *vu_sq, struct nvmf_vfio_user_req *vu_req)
 {
 	memset(&vu_req->cmd, 0, sizeof(vu_req->cmd));
 	memset(&vu_req->rsp, 0, sizeof(vu_req->rsp));
 	vu_req->iovcnt = 0;
 	vu_req->state = VFIO_USER_REQUEST_STATE_FREE;
 
-	TAILQ_INSERT_TAIL(&vu_qpair->reqs, vu_req, link);
+	TAILQ_INSERT_TAIL(&vu_sq->reqs, vu_req, link);
 }
 
 static int
 nvmf_vfio_user_req_free(struct spdk_nvmf_request *req)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
 	struct nvmf_vfio_user_req *vu_req;
 
 	assert(req != NULL);
 
 	vu_req = SPDK_CONTAINEROF(req, struct nvmf_vfio_user_req, req);
-	vu_qpair = SPDK_CONTAINEROF(req->qpair, struct nvmf_vfio_user_qpair, qpair);
+	vu_sq = SPDK_CONTAINEROF(req->qpair, struct nvmf_vfio_user_sq, qpair);
 
-	_nvmf_vfio_user_req_free(vu_qpair, vu_req);
+	_nvmf_vfio_user_req_free(vu_sq, vu_req);
 
 	return 0;
 }
@@ -2578,21 +3290,21 @@ nvmf_vfio_user_req_free(struct spdk_nvmf_request *req)
 static int
 nvmf_vfio_user_req_complete(struct spdk_nvmf_request *req)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
 	struct nvmf_vfio_user_req *vu_req;
 
 	assert(req != NULL);
 
 	vu_req = SPDK_CONTAINEROF(req, struct nvmf_vfio_user_req, req);
-	vu_qpair = SPDK_CONTAINEROF(req->qpair, struct nvmf_vfio_user_qpair, qpair);
+	vu_sq = SPDK_CONTAINEROF(req->qpair, struct nvmf_vfio_user_sq, qpair);
 
 	if (vu_req->cb_fn != NULL) {
 		if (vu_req->cb_fn(vu_req, vu_req->cb_arg) != 0) {
-			fail_ctrlr(vu_qpair->ctrlr);
+			fail_ctrlr(vu_sq->ctrlr);
 		}
 	}
 
-	_nvmf_vfio_user_req_free(vu_qpair, vu_req);
+	_nvmf_vfio_user_req_free(vu_sq, vu_req);
 
 	return 0;
 }
@@ -2601,18 +3313,23 @@ static void
 nvmf_vfio_user_close_qpair(struct spdk_nvmf_qpair *qpair,
 			   spdk_nvmf_transport_qpair_fini_cb cb_fn, void *cb_arg)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr;
+	struct nvmf_vfio_user_endpoint *endpoint;
 
 	assert(qpair != NULL);
-	vu_qpair = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_qpair, qpair);
-	vu_ctrlr = vu_qpair->ctrlr;
+	vu_sq = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_sq, qpair);
+	vu_ctrlr = vu_sq->ctrlr;
+	endpoint = vu_ctrlr->endpoint;
 
-	pthread_mutex_lock(&vu_ctrlr->endpoint->lock);
-	TAILQ_REMOVE(&vu_ctrlr->connected_qps, vu_qpair, tailq);
-	pthread_mutex_unlock(&vu_ctrlr->endpoint->lock);
-
-	free_qp(vu_ctrlr, qpair->qid);
+	pthread_mutex_lock(&endpoint->lock);
+	TAILQ_REMOVE(&vu_ctrlr->connected_sqs, vu_sq, tailq);
+	delete_sq_done(vu_ctrlr, vu_sq);
+	if (TAILQ_EMPTY(&vu_ctrlr->connected_sqs)) {
+		endpoint->ctrlr = NULL;
+		free_ctrlr(vu_ctrlr);
+	}
+	pthread_mutex_unlock(&endpoint->lock);
 
 	if (cb_fn) {
 		cb_fn(cb_arg);
@@ -2623,18 +3340,20 @@ nvmf_vfio_user_close_qpair(struct spdk_nvmf_qpair *qpair,
  * Returns a preallocated spdk_nvmf_request or NULL if there isn't one available.
  */
 static struct nvmf_vfio_user_req *
-get_nvmf_vfio_user_req(struct nvmf_vfio_user_qpair *qpair)
+get_nvmf_vfio_user_req(struct nvmf_vfio_user_sq *vu_sq)
 {
 	struct nvmf_vfio_user_req *req;
 
-	assert(qpair != NULL);
-
-	if (TAILQ_EMPTY(&qpair->reqs)) {
+	if (vu_sq == NULL) {
 		return NULL;
 	}
 
-	req = TAILQ_FIRST(&qpair->reqs);
-	TAILQ_REMOVE(&qpair->reqs, req, link);
+	if (TAILQ_EMPTY(&vu_sq->reqs)) {
+		return NULL;
+	}
+
+	req = TAILQ_FIRST(&vu_sq->reqs);
+	TAILQ_REMOVE(&vu_sq->reqs, req, link);
 
 	return req;
 }
@@ -2778,7 +3497,7 @@ map_io_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvmf_request *req
 
 static int
 handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
-	       struct nvmf_vfio_user_qpair *vu_qpair)
+	       struct nvmf_vfio_user_sq *vu_sq)
 {
 	int err;
 	struct nvmf_vfio_user_req *vu_req;
@@ -2787,10 +3506,10 @@ handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	assert(ctrlr != NULL);
 	assert(cmd != NULL);
 
-	vu_req = get_nvmf_vfio_user_req(vu_qpair);
+	vu_req = get_nvmf_vfio_user_req(vu_sq);
 	if (spdk_unlikely(vu_req == NULL)) {
 		SPDK_ERRLOG("%s: no request for NVMe command opc 0x%x\n", ctrlr_id(ctrlr), cmd->opc);
-		return post_completion(ctrlr, &vu_qpair->cq, 0, 0, cmd->cid,
+		return post_completion(ctrlr, ctrlr->cqs[vu_sq->sq.cqid], 0, 0, cmd->cid,
 				       SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, SPDK_NVME_SCT_GENERIC);
 
 	}
@@ -2801,7 +3520,7 @@ handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 		      ctrlr_id(ctrlr), req->qpair->qid, cmd->opc, cmd->cid);
 
 	vu_req->cb_fn = handle_cmd_rsp;
-	vu_req->cb_arg = SPDK_CONTAINEROF(req->qpair, struct nvmf_vfio_user_qpair, qpair);
+	vu_req->cb_arg = SPDK_CONTAINEROF(req->qpair, struct nvmf_vfio_user_sq, qpair);
 	req->cmd->nvme_cmd = *cmd;
 
 	if (nvmf_qpair_is_admin_queue(req->qpair)) {
@@ -2826,7 +3545,7 @@ handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 		req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 		err = handle_cmd_rsp(vu_req, vu_req->cb_arg);
-		_nvmf_vfio_user_req_free(vu_qpair, vu_req);
+		_nvmf_vfio_user_req_free(vu_sq, vu_req);
 		return err;
 	}
 
@@ -2838,15 +3557,15 @@ handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 
 /* Returns the number of commands processed, or a negative value on error. */
 static int
-nvmf_vfio_user_qpair_poll(struct nvmf_vfio_user_qpair *qpair)
+nvmf_vfio_user_sq_poll(struct nvmf_vfio_user_sq *vu_sq)
 {
 	struct nvmf_vfio_user_ctrlr *ctrlr;
 	uint32_t new_tail;
 	int count = 0;
 
-	assert(qpair != NULL);
+	assert(vu_sq != NULL);
 
-	ctrlr = qpair->ctrlr;
+	ctrlr = vu_sq->ctrlr;
 
 	/* On aarch64 platforms, doorbells update from guest VM may not be seen
 	 * on SPDK target side. This is because there is memory type mismatch
@@ -2858,10 +3577,10 @@ nvmf_vfio_user_qpair_poll(struct nvmf_vfio_user_qpair *qpair)
 	 * cannot fix this. Use "dc civac" to invalidate cache may solve
 	 * this.
 	 */
-	spdk_ivdt_dcache(tdbl(ctrlr, &qpair->sq));
+	spdk_ivdt_dcache(tdbl(ctrlr, &vu_sq->sq));
 
 	/* Load-Acquire. */
-	new_tail = *tdbl(ctrlr, &qpair->sq);
+	new_tail = *tdbl(ctrlr, &vu_sq->sq);
 
 	/*
 	 * Ensure that changes to the queue are visible to us.
@@ -2871,23 +3590,23 @@ nvmf_vfio_user_qpair_poll(struct nvmf_vfio_user_qpair *qpair)
 	spdk_rmb();
 
 	new_tail = new_tail & 0xffffu;
-	if (spdk_unlikely(new_tail >= qpair->sq.size)) {
+	if (spdk_unlikely(new_tail >= vu_sq->sq.size)) {
 		union spdk_nvme_async_event_completion event = {};
 
-		SPDK_DEBUGLOG(nvmf_vfio, "%s: invalid SQ%u doorbell value %u\n", ctrlr_id(ctrlr), qpair->qpair.qid,
+		SPDK_DEBUGLOG(nvmf_vfio, "%s: invalid SQ%u doorbell value %u\n", ctrlr_id(ctrlr), vu_sq->sq.qid,
 			      new_tail);
 		event.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_ERROR;
 		event.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_INVALID_DB_WRITE;
-		nvmf_ctrlr_async_event_error_event(qpair->qpair.ctrlr, event);
+		nvmf_ctrlr_async_event_error_event(ctrlr->ctrlr, event);
 
 		return 0;
 	}
 
-	if (sq_head(qpair) == new_tail) {
+	if (sq_head(vu_sq) == new_tail) {
 		return 0;
 	}
 
-	count = handle_sq_tdbl_write(ctrlr, new_tail, qpair);
+	count = handle_sq_tdbl_write(ctrlr, new_tail, vu_sq);
 	if (count < 0) {
 		fail_ctrlr(ctrlr);
 	}
@@ -2906,7 +3625,7 @@ static int
 nvmf_vfio_user_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
 	struct nvmf_vfio_user_poll_group *vu_group;
-	struct nvmf_vfio_user_qpair *vu_qpair, *tmp;
+	struct nvmf_vfio_user_sq *vu_sq, *tmp;
 	int count = 0;
 
 	assert(group != NULL);
@@ -2915,14 +3634,14 @@ nvmf_vfio_user_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 	vu_group = SPDK_CONTAINEROF(group, struct nvmf_vfio_user_poll_group, group);
 
-	TAILQ_FOREACH_SAFE(vu_qpair, &vu_group->qps, link, tmp) {
+	TAILQ_FOREACH_SAFE(vu_sq, &vu_group->sqs, link, tmp) {
 		int ret;
 
-		if (spdk_unlikely(vu_qpair->state != VFIO_USER_QPAIR_ACTIVE || !vu_qpair->sq.size)) {
+		if (spdk_unlikely(vu_sq->sq_state != VFIO_USER_SQ_ACTIVE || !vu_sq->sq.size)) {
 			continue;
 		}
 
-		ret = nvmf_vfio_user_qpair_poll(vu_qpair);
+		ret = nvmf_vfio_user_sq_poll(vu_sq);
 
 		if (ret < 0) {
 			return ret;
@@ -2938,11 +3657,11 @@ static int
 nvmf_vfio_user_qpair_get_local_trid(struct spdk_nvmf_qpair *qpair,
 				    struct spdk_nvme_transport_id *trid)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
 	struct nvmf_vfio_user_ctrlr *ctrlr;
 
-	vu_qpair = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_qpair, qpair);
-	ctrlr = vu_qpair->ctrlr;
+	vu_sq = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_sq, qpair);
+	ctrlr = vu_sq->ctrlr;
 
 	memcpy(trid, &ctrlr->endpoint->trid, sizeof(*trid));
 	return 0;
@@ -2959,11 +3678,11 @@ static int
 nvmf_vfio_user_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 				     struct spdk_nvme_transport_id *trid)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
 	struct nvmf_vfio_user_ctrlr *ctrlr;
 
-	vu_qpair = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_qpair, qpair);
-	ctrlr = vu_qpair->ctrlr;
+	vu_sq = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_sq, qpair);
+	ctrlr = vu_sq->ctrlr;
 
 	memcpy(trid, &ctrlr->endpoint->trid, sizeof(*trid));
 	return 0;
@@ -2973,16 +3692,16 @@ static void
 nvmf_vfio_user_qpair_abort_request(struct spdk_nvmf_qpair *qpair,
 				   struct spdk_nvmf_request *req)
 {
-	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct nvmf_vfio_user_sq *vu_sq;
 	struct nvmf_vfio_user_req *vu_req, *vu_req_to_abort = NULL;
 	uint32_t i;
 	uint16_t cid;
 
-	vu_qpair = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_qpair, qpair);
+	vu_sq = SPDK_CONTAINEROF(qpair, struct nvmf_vfio_user_sq, qpair);
 
 	cid = req->cmd->nvme_cmd.cdw10_bits.abort.cid;
-	for (i = 0; i < vu_qpair->qsize; i++) {
-		vu_req = &vu_qpair->reqs_internal[i];
+	for (i = 0; i < vu_sq->qsize; i++) {
+		vu_req = &vu_sq->reqs_internal[i];
 		if (vu_req->state == VFIO_USER_REQUEST_STATE_EXECUTING && vu_req->cmd.cid == cid) {
 			vu_req_to_abort = vu_req;
 			break;
@@ -3028,6 +3747,7 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_vfio_user = {
 	.listener_discover = nvmf_vfio_user_discover,
 
 	.poll_group_create = nvmf_vfio_user_poll_group_create,
+	.get_optimal_poll_group = nvmf_vfio_user_get_optimal_poll_group,
 	.poll_group_destroy = nvmf_vfio_user_poll_group_destroy,
 	.poll_group_add = nvmf_vfio_user_poll_group_add,
 	.poll_group_remove = nvmf_vfio_user_poll_group_remove,

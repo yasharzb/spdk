@@ -47,7 +47,7 @@ DEPDIRS-rte_vhost :=
 DEPDIRS-env_dpdk := log util
 
 DEPDIRS-ioat := log
-DEPDIRS-idxd := log
+DEPDIRS-idxd := log util
 DEPDIRS-sock := log $(JSON_LIBS)
 DEPDIRS-util := log
 DEPDIRS-vmd := log
@@ -142,7 +142,6 @@ DEPDIRS-bdev_gpt := bdev json log thread util
 
 DEPDIRS-bdev_error := $(BDEV_DEPS)
 DEPDIRS-bdev_lvol := $(BDEV_DEPS) lvol blob blob_bdev
-DEPDIRS-bdev_malloc := $(BDEV_DEPS) accel
 DEPDIRS-bdev_rpc := $(BDEV_DEPS)
 DEPDIRS-bdev_split := $(BDEV_DEPS)
 
@@ -151,6 +150,7 @@ DEPDIRS-bdev_compress := $(BDEV_DEPS_THREAD) reduce
 DEPDIRS-bdev_crypto := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_delay := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_iscsi := $(BDEV_DEPS_THREAD)
+DEPDIRS-bdev_malloc := $(BDEV_DEPS_THREAD) accel
 DEPDIRS-bdev_null := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_nvme = $(BDEV_DEPS_THREAD) accel nvme
 DEPDIRS-bdev_ocf := $(BDEV_DEPS_THREAD)

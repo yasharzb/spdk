@@ -3,7 +3,7 @@
  *
  *   Copyright (c) Intel Corporation. All rights reserved.
  *   Copyright (c) 2019-2021 Mellanox Technologies LTD. All rights reserved.
- *   Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *   Copyright (c) 2021, 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -43,7 +43,6 @@
 
 struct nvme_active_ns_ctx;
 
-static void nvme_ctrlr_destruct_namespaces(struct spdk_nvme_ctrlr *ctrlr);
 static int nvme_ctrlr_construct_and_submit_aer(struct spdk_nvme_ctrlr *ctrlr,
 		struct nvme_async_event_request *aer);
 static void nvme_ctrlr_identify_active_ns_async(struct nvme_active_ns_ctx *ctx);
@@ -53,6 +52,20 @@ static int nvme_ctrlr_identify_id_desc_async(struct spdk_nvme_ns *ns);
 static void nvme_ctrlr_init_cap(struct spdk_nvme_ctrlr *ctrlr);
 static void nvme_ctrlr_set_state(struct spdk_nvme_ctrlr *ctrlr, enum nvme_ctrlr_state state,
 				 uint64_t timeout_in_ms);
+
+static int
+nvme_ns_cmp(struct spdk_nvme_ns *ns1, struct spdk_nvme_ns *ns2)
+{
+	if (ns1->id < ns2->id) {
+		return -1;
+	} else if (ns1->id > ns2->id) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+RB_GENERATE_STATIC(nvme_ns_tree, spdk_nvme_ns, node, nvme_ns_cmp);
 
 #define CTRLR_STRING(ctrlr) \
 	((ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_TCP || ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_RDMA) ? \
@@ -613,11 +626,11 @@ spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair)
 		return 0;
 	}
 
+	nvme_transport_ctrlr_disconnect_qpair(ctrlr, qpair);
+
 	if (qpair->poll_group) {
 		spdk_nvme_poll_group_remove(qpair->poll_group->group, qpair);
 	}
-
-	nvme_transport_ctrlr_disconnect_qpair(ctrlr, qpair);
 
 	/* Do not retry. */
 	nvme_qpair_set_state(qpair, NVME_QPAIR_DESTROYING);
@@ -628,7 +641,7 @@ spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair)
 	 * with that qpair, since the callbacks will also be foreign to this process.
 	 */
 	if (qpair->active_proc == nvme_ctrlr_get_current_process(ctrlr)) {
-		nvme_qpair_abort_all_queued_reqs(qpair, 1);
+		nvme_qpair_abort_all_queued_reqs(qpair, 0);
 	}
 
 	nvme_robust_mutex_lock(&ctrlr->ctrlr_lock);
@@ -1701,6 +1714,7 @@ nvme_ctrlr_reset_pre(struct spdk_nvme_ctrlr *ctrlr)
 int
 spdk_nvme_ctrlr_reconnect_poll_async(struct spdk_nvme_ctrlr *ctrlr)
 {
+	struct spdk_nvme_ns *ns, *tmp_ns;
 	struct spdk_nvme_qpair	*qpair;
 	int rc = 0, rc_tmp = 0;
 	bool async;
@@ -1738,6 +1752,17 @@ spdk_nvme_ctrlr_reconnect_poll_async(struct spdk_nvme_ctrlr *ctrlr)
 				qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_LOCAL;
 				continue;
 			}
+		}
+	}
+
+	/*
+	 * Take this opportunity to remove inactive namespaces. During a reset namespace
+	 * handles can be invalidated.
+	 */
+	RB_FOREACH_SAFE(ns, nvme_ns_tree, &ctrlr->ns, tmp_ns) {
+		if (!ns->active) {
+			RB_REMOVE(nvme_ns_tree, &ctrlr->ns, ns);
+			spdk_free(ns);
 		}
 	}
 
@@ -2206,16 +2231,18 @@ nvme_active_ns_ctx_destroy(struct nvme_active_ns_ctx *ctx)
 static int
 nvme_ctrlr_destruct_namespace(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 {
-	struct spdk_nvme_ns *ns;
+	struct spdk_nvme_ns tmp, *ns;
 
 	assert(ctrlr != NULL);
 
-	if (nsid < 1 || nsid > ctrlr->num_ns) {
+	tmp.id = nsid;
+	ns = RB_FIND(nvme_ns_tree, &ctrlr->ns, &tmp);
+	if (ns == NULL) {
 		return -EINVAL;
 	}
 
-	ns = &ctrlr->ns[nsid - 1];
 	nvme_ns_destruct(ns);
+	ns->active = false;
 
 	return 0;
 }
@@ -2225,34 +2252,72 @@ nvme_ctrlr_construct_namespace(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 {
 	struct spdk_nvme_ns *ns;
 
-	ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
-
-	if (ns == NULL) {
+	if (nsid < 1 || nsid > ctrlr->cdata.nn) {
 		return -EINVAL;
 	}
 
-	return nvme_ns_construct(ns, nsid, ctrlr);
+	/* Namespaces are constructed on demand, so simply request it. */
+	ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+	if (ns == NULL) {
+		return -ENOMEM;
+	}
+
+	ns->active = true;
+
+	return 0;
 }
 
 static void
-nvme_ctrlr_identify_active_ns_swap(struct spdk_nvme_ctrlr *ctrlr, uint32_t **new_ns_list,
+nvme_ctrlr_identify_active_ns_swap(struct spdk_nvme_ctrlr *ctrlr, uint32_t *new_ns_list,
 				   size_t max_entries)
 {
 	uint32_t active_ns_count = 0;
 	size_t i;
+	uint32_t nsid;
+	struct spdk_nvme_ns *ns, *tmp_ns;
+	int rc;
 
+	/* First, remove namespaces that no longer exist */
+	RB_FOREACH_SAFE(ns, nvme_ns_tree, &ctrlr->ns, tmp_ns) {
+		nsid = new_ns_list[0];
+		active_ns_count = 0;
+		while (nsid != 0) {
+			if (nsid == ns->id) {
+				break;
+			}
+
+			nsid = new_ns_list[active_ns_count++];
+		}
+
+		if (nsid != ns->id) {
+			/* Did not find this namespace id in the new list. */
+			NVME_CTRLR_DEBUGLOG(ctrlr, "Namespace %u was removed\n", ns->id);
+			nvme_ctrlr_destruct_namespace(ctrlr, ns->id);
+		}
+	}
+
+	/* Next, add new namespaces */
+	active_ns_count = 0;
 	for (i = 0; i < max_entries; i++) {
-		if ((*new_ns_list)[active_ns_count] == 0) {
+		nsid = new_ns_list[active_ns_count];
+
+		if (nsid == 0) {
 			break;
+		}
+
+		/* If the namespace already exists, this will not construct it a second time. */
+		rc = nvme_ctrlr_construct_namespace(ctrlr, nsid);
+		if (rc != 0) {
+			/* We can't easily handle a failure here. But just move on. */
+			assert(false);
+			NVME_CTRLR_DEBUGLOG(ctrlr, "Failed to allocate a namespace object.\n");
+			continue;
 		}
 
 		active_ns_count++;
 	}
 
-	spdk_free(ctrlr->active_ns_list);
-	ctrlr->active_ns_list = *new_ns_list;
 	ctrlr->active_ns_count = active_ns_count;
-	*new_ns_list = NULL;
 }
 
 static void
@@ -2355,13 +2420,11 @@ out:
 	}
 }
 
-static int nvme_ctrlr_construct_namespaces(struct spdk_nvme_ctrlr *ctrlr);
-
 static void
 _nvme_active_ns_ctx_deleter(struct nvme_active_ns_ctx *ctx)
 {
-	int rc;
 	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
+	struct spdk_nvme_ns *ns;
 
 	if (ctx->state == NVME_ACTIVE_NS_STATE_ERROR) {
 		nvme_active_ns_ctx_destroy(ctx);
@@ -2371,15 +2434,11 @@ _nvme_active_ns_ctx_deleter(struct nvme_active_ns_ctx *ctx)
 
 	assert(ctx->state == NVME_ACTIVE_NS_STATE_DONE);
 
-	rc = nvme_ctrlr_construct_namespaces(ctrlr);
-	if (rc) {
-		NVME_CTRLR_ERRLOG(ctrlr, "Unable to construct namespace array!\n");
-		nvme_active_ns_ctx_destroy(ctx);
-		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
-		return;
+	RB_FOREACH(ns, nvme_ns_tree, &ctrlr->ns) {
+		nvme_ns_free_iocs_specific_data(ns);
 	}
 
-	nvme_ctrlr_identify_active_ns_swap(ctrlr, &ctx->new_ns_list, ctx->page_count * 1024);
+	nvme_ctrlr_identify_active_ns_swap(ctrlr, ctx->new_ns_list, ctx->page_count * 1024);
 	nvme_active_ns_ctx_destroy(ctx);
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_IDENTIFY_NS, ctrlr->opts.admin_timeout_ms);
 }
@@ -2426,7 +2485,7 @@ nvme_ctrlr_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr)
 	}
 
 	assert(ctx->state == NVME_ACTIVE_NS_STATE_DONE);
-	nvme_ctrlr_identify_active_ns_swap(ctrlr, &ctx->new_ns_list, ctx->page_count * 1024);
+	nvme_ctrlr_identify_active_ns_swap(ctrlr, ctx->new_ns_list, ctx->page_count * 1024);
 	nvme_active_ns_ctx_destroy(ctx);
 
 	return 0;
@@ -2947,91 +3006,17 @@ nvme_ctrlr_set_host_id(struct spdk_nvme_ctrlr *ctrlr)
 	return 0;
 }
 
-static void
-nvme_ctrlr_destruct_namespaces(struct spdk_nvme_ctrlr *ctrlr)
-{
-	if (ctrlr->ns) {
-		uint32_t i, num_ns = ctrlr->num_ns;
-
-		for (i = 1; i <= num_ns; i++) {
-			nvme_ctrlr_destruct_namespace(ctrlr, i);
-		}
-
-		spdk_free(ctrlr->ns);
-		ctrlr->ns = NULL;
-		ctrlr->num_ns = 0;
-	}
-}
-
 void
 nvme_ctrlr_update_namespaces(struct spdk_nvme_ctrlr *ctrlr)
 {
-	uint32_t i, nn = ctrlr->cdata.nn;
-	struct spdk_nvme_ns_data *nsdata;
-	bool ns_is_active;
+	uint32_t nsid;
+	struct spdk_nvme_ns *ns;
 
-	for (i = 0; i < nn; i++) {
-		uint32_t		nsid = i + 1;
-		struct spdk_nvme_ns	*ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
-
-		assert(ns != NULL);
-		nsdata = &ns->nsdata;
-		ns_is_active = spdk_nvme_ctrlr_is_active_ns(ctrlr, nsid);
-
-		if (ns_is_active) {
-			NVME_CTRLR_DEBUGLOG(ctrlr, "Namespace %u was added\n", nsid);
-			if (nvme_ctrlr_construct_namespace(ctrlr, nsid) != 0) {
-				continue;
-			}
-		}
-
-		if (nsdata->ncap && !ns_is_active) {
-			NVME_CTRLR_DEBUGLOG(ctrlr, "Namespace %u was removed\n", nsid);
-			nvme_ctrlr_destruct_namespace(ctrlr, nsid);
-		}
+	for (nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr);
+	     nsid != 0; nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, nsid)) {
+		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+		nvme_ns_construct(ns, nsid, ctrlr);
 	}
-}
-
-static int
-nvme_ctrlr_construct_namespaces(struct spdk_nvme_ctrlr *ctrlr)
-{
-	int rc = 0;
-	uint32_t i, nn = ctrlr->cdata.nn;
-	struct spdk_nvme_ns *tmp;
-
-	/* ctrlr->num_ns may be 0 (startup) or a different number of namespaces (reset),
-	 * so check if we need to reallocate.
-	 */
-	if (nn != ctrlr->num_ns) {
-		tmp = spdk_realloc(ctrlr->ns, nn * sizeof(struct spdk_nvme_ns), 64);
-		if (tmp == NULL) {
-			rc = -ENOMEM;
-			goto fail;
-		}
-
-		if (nn > ctrlr->num_ns) {
-			memset(tmp + ctrlr->num_ns, 0, (nn - ctrlr->num_ns) * sizeof(struct spdk_nvme_ns));
-		}
-
-		ctrlr->ns = tmp;
-		ctrlr->num_ns = nn;
-	}
-
-	/*
-	 * The controller could have been reset with the same number of namespaces.
-	 * If so, we still need to free the iocs specific data, to get a clean slate.
-	 */
-	for (i = 0; i < ctrlr->num_ns; i++) {
-		nvme_ns_free_iocs_specific_data(&ctrlr->ns[i]);
-	}
-
-	return 0;
-
-fail:
-	nvme_ctrlr_destruct_namespaces(ctrlr);
-	NVME_CTRLR_ERRLOG(ctrlr, "Failed to construct namespaces, err %d\n", rc);
-	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
-	return rc;
 }
 
 static int
@@ -4113,6 +4098,8 @@ nvme_ctrlr_construct(struct spdk_nvme_ctrlr *ctrlr)
 	TAILQ_INIT(&ctrlr->active_procs);
 	STAILQ_INIT(&ctrlr->register_operations);
 
+	RB_INIT(&ctrlr->ns);
+
 	return rc;
 }
 
@@ -4179,6 +4166,7 @@ int
 nvme_ctrlr_destruct_poll_async(struct spdk_nvme_ctrlr *ctrlr,
 			       struct nvme_ctrlr_detach_ctx *ctx)
 {
+	struct spdk_nvme_ns *ns, *tmp_ns;
 	int rc = 0;
 
 	if (!ctx->shutdown_complete) {
@@ -4193,9 +4181,14 @@ nvme_ctrlr_destruct_poll_async(struct spdk_nvme_ctrlr *ctrlr,
 		ctx->cb_fn(ctrlr);
 	}
 
-	nvme_ctrlr_destruct_namespaces(ctrlr);
-	spdk_free(ctrlr->active_ns_list);
-	ctrlr->active_ns_list = NULL;
+	nvme_transport_ctrlr_disconnect_qpair(ctrlr, ctrlr->adminq);
+
+	RB_FOREACH_SAFE(ns, nvme_ns_tree, &ctrlr->ns, tmp_ns) {
+		nvme_ctrlr_destruct_namespace(ctrlr, ns->id);
+		RB_REMOVE(nvme_ns_tree, &ctrlr->ns, ns);
+		spdk_free(ns);
+	}
+
 	ctrlr->active_ns_count = 0;
 
 	spdk_bit_array_free(&ctrlr->free_io_qids);
@@ -4397,73 +4390,98 @@ spdk_nvme_ctrlr_get_pmrsz(struct spdk_nvme_ctrlr *ctrlr)
 uint32_t
 spdk_nvme_ctrlr_get_num_ns(struct spdk_nvme_ctrlr *ctrlr)
 {
-	return ctrlr->num_ns;
-}
-
-static int32_t
-nvme_ctrlr_active_ns_idx(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
-{
-	int32_t result = -1;
-
-	if (ctrlr->active_ns_list == NULL ||
-	    ctrlr->active_ns_count == 0 ||
-	    nsid == 0 ||
-	    nsid > ctrlr->cdata.nn) {
-		return result;
-	}
-
-	int32_t lower = 0;
-	int32_t upper = ctrlr->active_ns_count - 1;
-	int32_t mid;
-
-	while (lower <= upper) {
-		mid = lower + (upper - lower) / 2;
-		if (ctrlr->active_ns_list[mid] == nsid) {
-			result = mid;
-			break;
-		} else {
-			if (ctrlr->active_ns_list[mid] != 0 && ctrlr->active_ns_list[mid] < nsid) {
-				lower = mid + 1;
-			} else {
-				upper = mid - 1;
-			}
-
-		}
-	}
-
-	return result;
+	return ctrlr->cdata.nn;
 }
 
 bool
 spdk_nvme_ctrlr_is_active_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 {
-	return nvme_ctrlr_active_ns_idx(ctrlr, nsid) != -1;
+	struct spdk_nvme_ns tmp, *ns;
+
+	tmp.id = nsid;
+	ns = RB_FIND(nvme_ns_tree, &ctrlr->ns, &tmp);
+
+	if (ns != NULL) {
+		return ns->active;
+	}
+
+	return false;
 }
 
 uint32_t
 spdk_nvme_ctrlr_get_first_active_ns(struct spdk_nvme_ctrlr *ctrlr)
 {
-	return ctrlr->active_ns_list ? ctrlr->active_ns_list[0] : 0;
+	struct spdk_nvme_ns *ns;
+
+	ns = RB_MIN(nvme_ns_tree, &ctrlr->ns);
+	if (ns == NULL) {
+		return 0;
+	}
+
+	while (ns != NULL) {
+		if (ns->active) {
+			return ns->id;
+		}
+
+		ns = RB_NEXT(nvme_ns_tree, &ctrlr->ns, ns);
+	}
+
+	return 0;
 }
 
 uint32_t
 spdk_nvme_ctrlr_get_next_active_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t prev_nsid)
 {
-	int32_t nsid_idx = nvme_ctrlr_active_ns_idx(ctrlr, prev_nsid);
-	if (nsid_idx >= 0 && (uint32_t)(nsid_idx + 1) < ctrlr->active_ns_count) {
-		return ctrlr->active_ns_list[nsid_idx + 1];
+	struct spdk_nvme_ns tmp, *ns;
+
+	tmp.id = prev_nsid;
+	ns = RB_FIND(nvme_ns_tree, &ctrlr->ns, &tmp);
+	if (ns == NULL) {
+		return 0;
 	}
+
+	ns = RB_NEXT(nvme_ns_tree, &ctrlr->ns, ns);
+	while (ns != NULL) {
+		if (ns->active) {
+			return ns->id;
+		}
+
+		ns = RB_NEXT(nvme_ns_tree, &ctrlr->ns, ns);
+	}
+
 	return 0;
 }
 
 struct spdk_nvme_ns *
 spdk_nvme_ctrlr_get_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 {
-	if (nsid < 1 || nsid > ctrlr->num_ns) {
+	struct spdk_nvme_ns tmp;
+	struct spdk_nvme_ns *ns;
+
+	if (nsid < 1 || nsid > ctrlr->cdata.nn) {
 		return NULL;
 	}
 
-	return &ctrlr->ns[nsid - 1];
+	nvme_robust_mutex_lock(&ctrlr->ctrlr_lock);
+
+	tmp.id = nsid;
+	ns = RB_FIND(nvme_ns_tree, &ctrlr->ns, &tmp);
+
+	if (ns == NULL) {
+		ns = spdk_zmalloc(sizeof(struct spdk_nvme_ns), 64, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_SHARE);
+		if (ns == NULL) {
+			nvme_robust_mutex_unlock(&ctrlr->ctrlr_lock);
+			return NULL;
+		}
+
+		NVME_CTRLR_DEBUGLOG(ctrlr, "Namespace %u was added\n", nsid);
+		ns->id = nsid;
+		RB_INSERT(nvme_ns_tree, &ctrlr->ns, ns);
+	}
+
+	nvme_robust_mutex_unlock(&ctrlr->ctrlr_lock);
+
+	return ns;
 }
 
 struct spdk_pci_device *
@@ -4547,6 +4565,7 @@ spdk_nvme_ctrlr_attach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 			  struct spdk_nvme_ctrlr_list *payload)
 {
 	struct nvme_completion_poll_status	*status;
+	struct spdk_nvme_ns			*ns;
 	int					res;
 
 	if (nsid == 0) {
@@ -4579,7 +4598,8 @@ spdk_nvme_ctrlr_attach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 		return res;
 	}
 
-	return nvme_ctrlr_construct_namespace(ctrlr, nsid);
+	ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+	return nvme_ns_construct(ns, nsid, ctrlr);
 }
 
 int
@@ -4614,12 +4634,7 @@ spdk_nvme_ctrlr_detach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 	}
 	free(status);
 
-	res = nvme_ctrlr_identify_active_ns(ctrlr);
-	if (res) {
-		return res;
-	}
-
-	return nvme_ctrlr_destruct_namespace(ctrlr, nsid);
+	return nvme_ctrlr_identify_active_ns(ctrlr);
 }
 
 uint32_t
@@ -4687,12 +4702,7 @@ spdk_nvme_ctrlr_delete_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 	}
 	free(status);
 
-	res = nvme_ctrlr_identify_active_ns(ctrlr);
-	if (res) {
-		return res;
-	}
-
-	return nvme_ctrlr_destruct_namespace(ctrlr, nsid);
+	return nvme_ctrlr_identify_active_ns(ctrlr);
 }
 
 int

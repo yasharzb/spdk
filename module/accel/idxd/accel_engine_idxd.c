@@ -54,7 +54,6 @@ uint32_t g_config_number;
 
 enum channel_state {
 	IDXD_CHANNEL_ACTIVE,
-	IDXD_CHANNEL_PAUSED,
 	IDXD_CHANNEL_ERROR,
 };
 
@@ -75,7 +74,6 @@ struct idxd_io_channel {
 	enum channel_state		state;
 	struct spdk_poller		*poller;
 	uint32_t			num_outstanding;
-	uint32_t			max_outstanding;
 	TAILQ_HEAD(, spdk_accel_task)	queued_tasks;
 };
 
@@ -114,7 +112,6 @@ idxd_select_device(struct idxd_io_channel *chan)
 		 */
 		chan->chan = spdk_idxd_get_channel(dev->idxd);
 		if (chan->chan != NULL) {
-			chan->max_outstanding = spdk_idxd_chan_get_max_operations(chan->chan);
 			SPDK_DEBUGLOG(accel_idxd, "On socket %d using device on socket %d\n",
 				      socket_id, spdk_idxd_get_socket(dev->idxd));
 			return dev;
@@ -138,9 +135,7 @@ idxd_done(void *cb_arg, int status)
 
 	assert(chan->num_outstanding > 0);
 	spdk_trace_record(TRACE_IDXD_OP_COMPLETE, 0, 0, 0, chan->num_outstanding - 1);
-	if (chan->num_outstanding-- == chan->max_outstanding) {
-		chan->state = IDXD_CHANNEL_ACTIVE;
-	}
+	chan->num_outstanding--;
 
 	spdk_accel_task_complete(accel_task, status);
 }
@@ -151,38 +146,65 @@ _process_single_task(struct spdk_io_channel *ch, struct spdk_accel_task *task)
 	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
 	int rc = 0;
 	uint8_t fill_pattern = (uint8_t)task->fill_pattern;
-	void *src;
-
-	if (chan->num_outstanding == chan->max_outstanding) {
-		chan->state = IDXD_CHANNEL_PAUSED;
-		return -EBUSY;
-	}
+	struct iovec *iov;
+	uint32_t iovcnt;
+	struct iovec siov = {};
+	struct iovec diov = {};
 
 	switch (task->op_code) {
 	case ACCEL_OPCODE_MEMMOVE:
-		rc = spdk_idxd_submit_copy(chan->chan, task->dst, task->src, task->nbytes, idxd_done, task);
+		siov.iov_base = task->src;
+		siov.iov_len = task->nbytes;
+		diov.iov_base = task->dst;
+		diov.iov_len = task->nbytes;
+		rc = spdk_idxd_submit_copy(chan->chan, &diov, 1, &siov, 1, idxd_done, task);
 		break;
 	case ACCEL_OPCODE_DUALCAST:
 		rc = spdk_idxd_submit_dualcast(chan->chan, task->dst, task->dst2, task->src, task->nbytes,
 					       idxd_done, task);
 		break;
 	case ACCEL_OPCODE_COMPARE:
-		rc = spdk_idxd_submit_compare(chan->chan, task->src, task->src2, task->nbytes, idxd_done, task);
+		siov.iov_base = task->src;
+		siov.iov_len = task->nbytes;
+		diov.iov_base = task->dst;
+		diov.iov_len = task->nbytes;
+		rc = spdk_idxd_submit_compare(chan->chan, &siov, 1, &diov, 1, idxd_done, task);
 		break;
 	case ACCEL_OPCODE_MEMFILL:
 		memset(&task->fill_pattern, fill_pattern, sizeof(uint64_t));
-		rc = spdk_idxd_submit_fill(chan->chan, task->dst, task->fill_pattern, task->nbytes, idxd_done,
+		diov.iov_base = task->dst;
+		diov.iov_len = task->nbytes;
+		rc = spdk_idxd_submit_fill(chan->chan, &diov, 1, task->fill_pattern, idxd_done,
 					   task);
 		break;
 	case ACCEL_OPCODE_CRC32C:
-		src = (task->v.iovcnt == 0) ? task->src : task->v.iovs[0].iov_base;
-		rc = spdk_idxd_submit_crc32c(chan->chan, task->crc_dst, src, task->seed, task->nbytes, idxd_done,
-					     task);
+		if (task->v.iovcnt == 0) {
+			siov.iov_base = task->src;
+			siov.iov_len = task->nbytes;
+			iov = &siov;
+			iovcnt = 1;
+		} else {
+			iov = task->v.iovs;
+			iovcnt = task->v.iovcnt;
+		}
+		rc = spdk_idxd_submit_crc32c(chan->chan, iov, iovcnt, task->seed, task->crc_dst,
+					     idxd_done, task);
 		break;
 	case ACCEL_OPCODE_COPY_CRC32C:
-		src = (task->v.iovcnt == 0) ? task->src : task->v.iovs[0].iov_base;
-		rc = spdk_idxd_submit_copy_crc32c(chan->chan, task->dst, src, task->crc_dst, task->seed,
-						  task->nbytes, idxd_done, task);
+		if (task->v.iovcnt == 0) {
+			siov.iov_base = task->src;
+			siov.iov_len = task->nbytes;
+			iov = &siov;
+			iovcnt = 1;
+		} else {
+			iov = task->v.iovs;
+			iovcnt = task->v.iovcnt;
+		}
+		diov.iov_base = task->dst;
+		diov.iov_len = task->nbytes;
+		rc = spdk_idxd_submit_copy_crc32c(chan->chan, &diov, 1, iov, iovcnt,
+						  task->seed, task->crc_dst,
+						  idxd_done, task);
 		break;
 	default:
 		assert(false);
@@ -207,15 +229,17 @@ idxd_submit_tasks(struct spdk_io_channel *ch, struct spdk_accel_task *first_task
 
 	task = first_task;
 
-	if (chan->state == IDXD_CHANNEL_PAUSED) {
-		goto queue_tasks;
-	} else if (chan->state == IDXD_CHANNEL_ERROR) {
+	if (chan->state == IDXD_CHANNEL_ERROR) {
 		while (task) {
 			tmp = TAILQ_NEXT(task, link);
 			spdk_accel_task_complete(task, -EINVAL);
 			task = tmp;
 		}
 		return 0;
+	}
+
+	if (!TAILQ_EMPTY(&chan->queued_tasks)) {
+		goto queue_tasks;
 	}
 
 	/* The caller will either submit a single task or a group of tasks that are
@@ -295,7 +319,6 @@ idxd_create_cb(void *io_device, void *ctx_buf)
 {
 	struct idxd_io_channel *chan = ctx_buf;
 	struct idxd_device *dev;
-	int rc;
 
 	dev = idxd_select_device(chan);
 	if (dev == NULL) {
@@ -306,15 +329,6 @@ idxd_create_cb(void *io_device, void *ctx_buf)
 	chan->dev = dev;
 	chan->poller = SPDK_POLLER_REGISTER(idxd_poll, chan, 0);
 	TAILQ_INIT(&chan->queued_tasks);
-
-	rc = spdk_idxd_configure_chan(chan->chan);
-	if (rc) {
-		SPDK_ERRLOG("Failed to configure new channel rc = %d\n", rc);
-		chan->state = IDXD_CHANNEL_ERROR;
-		spdk_poller_unregister(&chan->poller);
-		return rc;
-	}
-
 	chan->num_outstanding = 0;
 	chan->state = IDXD_CHANNEL_ACTIVE;
 

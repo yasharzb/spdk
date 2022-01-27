@@ -61,13 +61,11 @@ static inline void movdir64b(void *dst, const void *src)
 
 /* TODO: consider setting the max per batch limit via RPC. */
 
-/* The following sets up a max desc count per batch of 16 */
-#define LOG2_WQ_MAX_BATCH	4  /* 2^4 = 16 */
+/* The following sets up a max desc count per batch of 32 */
+#define LOG2_WQ_MAX_BATCH	5  /* 2^5 = 32 */
 #define DESC_PER_BATCH		(1 << LOG2_WQ_MAX_BATCH)
-#define MIN_USER_DESC_COUNT	2
 
 #define LOG2_WQ_MAX_XFER	30 /* 2^30 = 1073741824 */
-#define WQCFG_NUM_DWORDS	8
 #define WQ_PRIORITY_1		1
 #define IDXD_MAX_QUEUES		64
 
@@ -77,6 +75,7 @@ static inline void movdir64b(void *dst, const void *src)
 struct idxd_batch {
 	struct idxd_hw_desc		*user_desc;
 	struct idxd_ops			*user_ops;
+	uint64_t			user_desc_addr;
 	uint8_t				index;
 	struct spdk_idxd_io_channel	*chan;
 	TAILQ_ENTRY(idxd_batch)		link;
@@ -96,6 +95,9 @@ struct spdk_idxd_io_channel {
 	/* The portal is the address that we write descriptors to for submission. */
 	void					*portal;
 	uint32_t				portal_offset;
+
+	/* The currently open batch */
+	struct idxd_batch			*batch;
 
 	/*
 	 * User descriptors (those included in a batch) are managed independently from

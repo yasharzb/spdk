@@ -57,25 +57,12 @@ struct spdk_idxd_io_channel;
 struct spdk_idxd_device;
 
 /**
- * Opaque handle for batching.
- */
-struct idxd_batch;
-
-/**
  * Get the socket that this device is on
  *
  * \param idxd device to query
  * \return socket number.
  */
 uint32_t spdk_idxd_get_socket(struct spdk_idxd_device *idxd);
-
-/**
- * Signature for configuring a channel
- *
- * \param chan IDXD channel to be configured
- * \return 0 on success, negative errno on failure.
- */
-int spdk_idxd_configure_chan(struct spdk_idxd_io_channel *chan);
 
 /**
  * Signature for callback function invoked when a request is completed.
@@ -130,96 +117,16 @@ void spdk_idxd_detach(struct spdk_idxd_device *idxd);
 void spdk_idxd_set_config(uint32_t config_number, bool kernel_mode);
 
 /**
- * Return the max number of descriptors per batch for IDXD.
- *
- * \return max number of descriptors per batch.
- */
-uint32_t spdk_idxd_batch_get_max(void);
-
-/**
- * Create a batch sequence.
- *
- * \param chan IDXD channel to submit request.
- *
- * \return handle to use for subsequent batch requests, NULL on failure.
- */
-struct idxd_batch *spdk_idxd_batch_create(struct spdk_idxd_io_channel *chan);
-
-/**
- * Submit a batch sequence.
- *
- * \param chan IDXD channel to submit request.
- * \param batch Handle provided when the batch was started with spdk_idxd_batch_create().
- * \param cb_fn Callback function which will be called when the request is complete.
- * \param cb_arg Opaque value which will be passed back as the arg parameter in
- * the completion callback.
- *
- * \return 0 on success, negative errno on failure.
- */
-int spdk_idxd_batch_submit(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
-			   spdk_idxd_req_cb cb_fn, void *cb_arg);
-
-/**
- * Cancel a batch sequence.
- *
- * \param chan IDXD channel to submit request.
- * \param batch Handle provided when the batch was started with spdk_idxd_batch_create().
- *
- * \return 0 on success, negative errno on failure.
- */
-int spdk_idxd_batch_cancel(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch);
-
-/**
- * Synchronous call to prepare a copy request into a previously initialized batch
- *  created with spdk_idxd_batch_create(). The callback will be called when the copy
- *  completes after the batch has been submitted by an asynchronous call to
- *  spdk_idxd_batch_submit().
- *
- * \param chan IDXD channel to submit request.
- * \param batch Handle provided when the batch was started with spdk_idxd_batch_create().
- * \param dst Destination virtual address.
- * \param src Source virtual address.
- * \param nbytes Number of bytes to copy.
- * \param cb_fn Callback function which will be called when the request is complete.
- * \param cb_arg Opaque value which will be passed back as the arg parameter in
- * the completion callback.
- *
- * \return 0 on success, negative errno on failure.
- */
-int spdk_idxd_batch_prep_copy(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
-			      void *dst, const void *src, uint64_t nbytes, spdk_idxd_req_cb cb_fn, void *cb_arg);
-
-/**
- * Synchronous call to prepare a dualcast request into a previously initialized batch
- *  created with spdk_idxd_batch_create(). The callback will be called when the dualcast
- *  completes after the batch has been submitted by an asynchronous call to
- *  spdk_idxd_batch_submit().
- *
- * \param chan IDXD channel to submit request.
- * \param batch Handle provided when the batch was started with spdk_idxd_batch_create().
- * \param dst1 First destination virtual address (must be 4K aligned).
- * \param dst2 Second destination virtual address (must be 4K aligned).
- * \param src Source virtual address.
- * \param nbytes Number of bytes to copy.
- * \param cb_fn Callback function which will be called when the request is complete.
- * \param cb_arg Opaque value which will be passed back as the arg parameter in
- * the completion callback.
- *
- * \return 0 on success, negative errno on failure.
- */
-int spdk_idxd_batch_prep_dualcast(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
-				  void *dst1, void *dst2, const void *src, uint64_t nbytes, spdk_idxd_req_cb cb_fn, void *cb_arg);
-
-/**
  * Build and submit an idxd memory copy request.
  *
  * This function will build the copy descriptor and then immediately submit
  * by writing to the proper device portal.
  *
  * \param chan IDXD channel to submit request.
- * \param dst Destination virtual address.
- * \param src Source virtual address.
- * \param nbytes Number of bytes to copy.
+ * \param diov Destination iovec
+ * \param diovcnt Number of elements in diov
+ * \param siov Source iovec
+ * \param siovcnt Number of elements in siov
  * \param cb_fn Callback function which will be called when the request is complete.
  * \param cb_arg Opaque value which will be passed back as the arg parameter in
  * the completion callback.
@@ -227,7 +134,8 @@ int spdk_idxd_batch_prep_dualcast(struct spdk_idxd_io_channel *chan, struct idxd
  * \return 0 on success, negative errno on failure.
  */
 int spdk_idxd_submit_copy(struct spdk_idxd_io_channel *chan,
-			  void *dst, const void *src, uint64_t nbytes,
+			  struct iovec *diov, uint32_t diovcnt,
+			  struct iovec *siov, uint32_t siovcnt,
 			  spdk_idxd_req_cb cb_fn, void *cb_arg);
 
 /**
@@ -252,36 +160,16 @@ int spdk_idxd_submit_dualcast(struct spdk_idxd_io_channel *chan,
 			      spdk_idxd_req_cb cb_fn, void *cb_arg);
 
 /**
- * Synchronous call to prepare a compare request into a previously initialized batch
- *  created with spdk_idxd_batch_create(). The callback will be called when the compare
- *  completes after the batch has been submitted by an asynchronous call to
- *  spdk_idxd_batch_submit().
- *
- * \param chan IDXD channel to submit request.
- * \param batch Handle provided when the batch was started with spdk_idxd_batch_create().
- * \param src1 First source to compare.
- * \param src2 Second source to compare.
- * \param nbytes Number of bytes to compare.
- * \param cb_fn Callback function which will be called when the request is complete.
- * \param cb_arg Opaque value which will be passed back as the arg parameter in
- * the completion callback.
- *
- * \return 0 on success, negative errno on failure.
- */
-int spdk_idxd_batch_prep_compare(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
-				 void *src1, void *src2, uint64_t nbytes, spdk_idxd_req_cb cb_fn,
-				 void *cb_arg);
-
-/**
  * Build and submit a memory compare request.
  *
  * This function will build the compare descriptor and then immediately submit
  * by writing to the proper device portal.
  *
  * \param chan IDXD channel to submit request.
- * \param src1 First source to compare.
- * \param src2 Second source to compare.
- * \param nbytes Number of bytes to compare.
+ * \param siov1 First source iovec
+ * \param siov1cnt Number of elements in siov1
+ * \param siov2 Second source iovec
+ * \param siov2cnt Number of elements in siov2
  * \param cb_fn Callback function which will be called when the request is complete.
  * \param cb_arg Opaque value which will be passed back as the arg parameter in
  * the completion callback.
@@ -289,28 +177,9 @@ int spdk_idxd_batch_prep_compare(struct spdk_idxd_io_channel *chan, struct idxd_
  * \return 0 on success, negative errno on failure.
  */
 int spdk_idxd_submit_compare(struct spdk_idxd_io_channel *chan,
-			     void *src1, const void *src2, uint64_t nbytes,
+			     struct iovec *siov1, size_t siov1cnt,
+			     struct iovec *siov2, size_t siov2cnt,
 			     spdk_idxd_req_cb cb_fn, void *cb_arg);
-
-/**
- * Synchronous call to prepare a fill request into a previously initialized batch
- *  created with spdk_idxd_batch_create(). The callback will be called when the fill
- *  completes after the batch has been submitted by an asynchronous call to
- *  spdk_idxd_batch_submit().
- *
- * \param chan IDXD channel to submit request.
- * \param batch Handle provided when the batch was started with spdk_idxd_batch_create().
- * \param dst Destination virtual address.
- * \param fill_pattern Repeating eight-byte pattern to use for memory fill.
- * \param nbytes Number of bytes to fill.
- * \param cb_fn Callback function which will be called when the request is complete.
- * \param cb_arg Opaque value which will be passed back as the arg parameter in
- * the completion callback.
- *
- * \return 0 on success, negative errno on failure.
- */
-int spdk_idxd_batch_prep_fill(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
-			      void *dst, uint64_t fill_pattern, uint64_t nbytes, spdk_idxd_req_cb cb_fn, void *cb_arg);
 
 /**
  * Build and submit a idxd memory fill request.
@@ -319,9 +188,9 @@ int spdk_idxd_batch_prep_fill(struct spdk_idxd_io_channel *chan, struct idxd_bat
  * by writing to the proper device portal.
  *
  * \param chan IDXD channel to submit request.
- * \param dst Destination virtual address.
+ * \param diov Destination iovec
+ * \param diovcnt Number of elements in diov
  * \param fill_pattern Repeating eight-byte pattern to use for memory fill.
- * \param nbytes Number of bytes to fill.
  * \param cb_fn Callback function which will be called when the request is complete.
  * \param cb_arg Opaque value which will be passed back as the cb_arg parameter
  * in the completion callback.
@@ -329,30 +198,8 @@ int spdk_idxd_batch_prep_fill(struct spdk_idxd_io_channel *chan, struct idxd_bat
  * \return 0 on success, negative errno on failure.
  */
 int spdk_idxd_submit_fill(struct spdk_idxd_io_channel *chan,
-			  void *dst, uint64_t fill_pattern, uint64_t nbytes,
-			  spdk_idxd_req_cb cb_fn, void *cb_arg);
-
-/**
- * Synchronous call to prepare a crc32c request into a previously initialized batch
- *  created with spdk_idxd_batch_create(). The callback will be called when the crc32c
- *  completes after the batch has been submitted by an asynchronous call to
- *  spdk_idxd_batch_submit().
- *
- * \param chan IDXD channel to submit request.
- * \param batch Handle provided when the batch was started with spdk_idxd_batch_create().
- * \param crc_dst Resulting calculation.
- * \param src Source virtual address.
- * \param seed Four byte CRC-32C seed value.
- * \param nbytes Number of bytes to calculate on.
- * \param cb_fn Callback function which will be called when the request is complete.
- * \param cb_arg Opaque value which will be passed back as the arg parameter in
- * the completion callback.
- *
- * \return 0 on success, negative errno on failure.
- */
-int spdk_idxd_batch_prep_crc32c(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
-				uint32_t *crc_dst, void *src, uint32_t seed, uint64_t nbytes,
-				spdk_idxd_req_cb cb_fn, void *cb_arg);
+			  struct iovec *diov, size_t diovcnt,
+			  uint64_t fill_pattern, spdk_idxd_req_cb cb_fn, void *cb_arg);
 
 /**
  * Build and submit a memory CRC32-C request.
@@ -361,42 +208,20 @@ int spdk_idxd_batch_prep_crc32c(struct spdk_idxd_io_channel *chan, struct idxd_b
  * by writing to the proper device portal.
  *
  * \param chan IDXD channel to submit request.
- * \param crc_dst Resulting calculation.
- * \param src Source virtual address.
+ * \param siov Source iovec
+ * \param siovcnt Number of elements in siov
  * \param seed Four byte CRC-32C seed value.
- * \param nbytes Number of bytes to calculate on.
+ * \param crc_dst Resulting calculation.
  * \param cb_fn Callback function which will be called when the request is complete.
  * \param cb_arg Opaque value which will be passed back as the cb_arg parameter
  * in the completion callback.
  *
  * \return 0 on success, negative errno on failure.
  */
-int spdk_idxd_submit_crc32c(struct spdk_idxd_io_channel *chan, uint32_t *crc_dst, void *src,
-			    uint32_t seed, uint64_t nbytes,
+int spdk_idxd_submit_crc32c(struct spdk_idxd_io_channel *chan,
+			    struct iovec *siov, size_t siovcnt,
+			    uint32_t seed, uint32_t *crc_dst,
 			    spdk_idxd_req_cb cb_fn, void *cb_arg);
-
-/**
- * Synchronous call to prepare a copy combined with crc32c request into a previously
- *  initialized batch created with spdk_idxd_batch_create(). The callback will be called
- *  when the copy + crc32c completes after the batch has been submitted by an asynchronous
- *  call to spdk_idxd_batch_submit().
- *
- * \param chan IDXD channel to submit request.
- * \param batch Handle provided when the batch was started with spdk_idxd_batch_create().
- * \param dst Destination virtual address.
- * \param src Source virtual address.
- * \param crc_dst Resulting calculation.
- * \param seed Four byte CRC-32C seed value.
- * \param nbytes Number of bytes to calculate on.
- * \param cb_fn Callback function which will be called when the request is complete.
- * \param cb_arg Opaque value which will be passed back as the arg parameter in
- * the completion callback.
- *
- * \return 0 on success, negative errno on failure.
- */
-int spdk_idxd_batch_prep_copy_crc32c(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
-				     void *dst, void *src, uint32_t *crc_dst, uint32_t seed, uint64_t nbytes,
-				     spdk_idxd_req_cb cb_fn, void *cb_arg);
 
 /**
  * Build and submit a copy combined with CRC32-C request.
@@ -405,19 +230,22 @@ int spdk_idxd_batch_prep_copy_crc32c(struct spdk_idxd_io_channel *chan, struct i
  * submit by writing to the proper device portal.
  *
  * \param chan IDXD channel to submit request.
- * \param dst Destination virtual address.
- * \param src Source virtual address.
- * \param crc_dst Resulting calculation.
+ * \param diov Destination iovec
+ * \param diovcnt Number of elements in diov
+ * \param siov Source iovec
+ * \param siovcnt Number of elements in siov
  * \param seed Four byte CRC-32C seed value.
- * \param nbytes Number of bytes to calculate on.
+ * \param crc_dst Resulting calculation.
  * \param cb_fn Callback function which will be called when the request is complete.
  * \param cb_arg Opaque value which will be passed back as the cb_arg parameter
  * in the completion callback.
  *
  * \return 0 on success, negative errno on failure.
  */
-int spdk_idxd_submit_copy_crc32c(struct spdk_idxd_io_channel *chan, void *dst, void *src,
-				 uint32_t *crc_dst, uint32_t seed, uint64_t nbytes,
+int spdk_idxd_submit_copy_crc32c(struct spdk_idxd_io_channel *chan,
+				 struct iovec *diov, size_t diovcnt,
+				 struct iovec *siov, size_t siovcnt,
+				 uint32_t seed, uint32_t *crc_dst,
 				 spdk_idxd_req_cb cb_fn, void *cb_arg);
 
 /**
@@ -442,14 +270,6 @@ struct spdk_idxd_io_channel *spdk_idxd_get_channel(struct spdk_idxd_device *idxd
  * \param chan IDXD channel to free.
  */
 void spdk_idxd_put_channel(struct spdk_idxd_io_channel *chan);
-
-/**
- * Get the max number of outstanding operations supported by this channel.
- *
- * \param chan IDXD channel to communicate on.
- * \return max number of operations supported.
- */
-int spdk_idxd_chan_get_max_operations(struct spdk_idxd_io_channel *chan);
 
 #ifdef __cplusplus
 }

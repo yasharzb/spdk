@@ -2,7 +2,7 @@
  *   BSD LICENSE
  *
  *   Copyright (c) Intel Corporation. All rights reserved.
- *   Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *   Copyright (c) 2021, 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -58,7 +58,6 @@ DEFINE_STUB(rdma_ack_cm_event, int, (struct rdma_cm_event *event), 0);
 DEFINE_STUB_V(rdma_free_devices, (struct ibv_context **list));
 DEFINE_STUB(fcntl, int, (int fd, int cmd, ...), 0);
 DEFINE_STUB_V(rdma_destroy_event_channel, (struct rdma_event_channel *channel));
-DEFINE_STUB(rdma_destroy_id, int, (struct rdma_cm_id *id), 0);
 
 DEFINE_STUB(ibv_dereg_mr, int, (struct ibv_mr *mr), 0);
 DEFINE_STUB(ibv_resize_cq, int, (struct ibv_cq *cq, int cqe), 0);
@@ -1038,7 +1037,6 @@ test_nvme_rdma_poll_group_connect_disconnect_qpair(void)
 	rc = nvme_rdma_poll_group_disconnect_qpair(&rqpair->qpair);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(rqpair->defer_deletion_to_pg == true);
-	CU_ASSERT(rqpair->poll_group_disconnect_in_progress == false);
 	CU_ASSERT(rqpair->cq == NULL);
 	CU_ASSERT(!STAILQ_EMPTY(&group.destroyed_qpairs));
 
@@ -1068,11 +1066,6 @@ test_nvme_rdma_poll_group_connect_disconnect_qpair(void)
 	CU_ASSERT(rc == -EINVAL);
 	CU_ASSERT(rqpair->cq == NULL);
 
-	/* Poll group disconnect in progress */
-	rqpair->poll_group_disconnect_in_progress = true;
-
-	rc = nvme_rdma_poll_group_disconnect_qpair(&rqpair->qpair);
-	CU_ASSERT(rc == -EINPROGRESS);
 	free(rqpair);
 }
 

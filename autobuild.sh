@@ -57,8 +57,16 @@ function build_native_dpdk() {
 	local external_dpdk_base_dir
 	local compiler_version
 	local compiler
+	local dpdk_kmods
 
 	compiler=${CC:-gcc}
+
+	# Export CC to be absolutely sure it's set.
+	# If CC was not set and we defaulted to "gcc" then we need to do the export
+	# so that "meson build" command a few lines below is aware of which compiler
+	# to use.
+	export CC="$compiler"
+
 	if [[ $compiler != *clang* && $compiler != *gcc* ]]; then
 		echo "Unsupported compiler detected ($compiler), failing the test" >&2
 		return 1
@@ -153,13 +161,20 @@ function build_native_dpdk() {
 		if [[ $dpdk_ver == 20.11* ]]; then
 			patch -p1 < "$rootdir/test/common/config/pkgdep/patches/dpdk/20.11/dpdk_pci.patch"
 			patch -p1 < "$rootdir/test/common/config/pkgdep/patches/dpdk/20.11/dpdk_qat.patch"
-		elif [[ $dpdk_ver == 21.08* ]]; then
-			patch -p1 < "$rootdir/test/common/config/pkgdep/patches/dpdk/21.08/dpdk_qat.patch"
+		elif [[ $dpdk_ver == 21.11* ]]; then
+			patch -p1 < "$rootdir/test/common/config/pkgdep/patches/dpdk/21.11/dpdk_qat.patch"
+		elif [[ $dpdk_ver == 22.03* ]]; then
+			patch -p1 < "$rootdir/test/common/config/pkgdep/patches/dpdk/22.03/dpdk_qat.patch"
 		fi
 	fi
 
+	dpdk_kmods="false"
+	if [ "$(uname -s)" = "FreeBSD" ]; then
+		dpdk_kmods="true"
+	fi
+
 	meson build-tmp --prefix="$external_dpdk_dir" --libdir lib \
-		-Denable_docs=false -Denable_kmods=false -Dtests=false \
+		-Denable_docs=false -Denable_kmods="$dpdk_kmods" -Dtests=false \
 		-Dc_link_args="$dpdk_ldflags" -Dc_args="$dpdk_cflags" \
 		-Dmachine=native -Denable_drivers=$(printf "%s," "${DPDK_DRIVERS[@]}")
 	ninja -C "$external_dpdk_base_dir/build-tmp" $MAKEFLAGS

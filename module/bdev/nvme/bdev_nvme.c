@@ -3,7 +3,7 @@
  *
  *   Copyright (c) Intel Corporation. All rights reserved.
  *   Copyright (c) 2019 Mellanox Technologies LTD. All rights reserved.
- *   Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *   Copyright (c) 2021, 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -52,6 +52,8 @@
 
 #include "spdk/bdev_module.h"
 #include "spdk/log.h"
+
+#include "spdk_internal/usdt.h"
 
 #define SPDK_BDEV_NVME_DEFAULT_DELAY_CMD_SUBMIT true
 #define SPDK_BDEV_NVME_DEFAULT_KEEP_ALIVE_TIMEOUT_IN_MS	(10000)
@@ -135,7 +137,7 @@ static struct spdk_bdev_nvme_opts g_opts = {
 	.nvme_ioq_poll_period_us = 0,
 	.io_queue_requests = 0,
 	.delay_cmd_submit = SPDK_BDEV_NVME_DEFAULT_DELAY_CMD_SUBMIT,
-	.bdev_retry_count = 0,
+	.bdev_retry_count = 3,
 };
 
 #define NVME_HOTPLUG_POLL_PERIOD_MAX			10000000ULL
@@ -390,6 +392,7 @@ static void
 nvme_bdev_ctrlr_delete(struct nvme_bdev_ctrlr *nbdev_ctrlr,
 		       struct nvme_ctrlr *nvme_ctrlr)
 {
+	SPDK_DTRACE_PROBE1(bdev_nvme_ctrlr_delete, nvme_ctrlr->nbdev_ctrlr->name);
 	pthread_mutex_lock(&g_bdev_nvme_mutex);
 
 	TAILQ_REMOVE(&nbdev_ctrlr->ctrlrs, nvme_ctrlr, tailq);
@@ -470,6 +473,8 @@ nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr)
 {
 	int rc;
 
+	spdk_poller_unregister(&nvme_ctrlr->reconnect_delay_timer);
+
 	/* First, unregister the adminq poller, as the driver will poll adminq if necessary */
 	spdk_poller_unregister(&nvme_ctrlr->adminq_timer_poller);
 
@@ -537,6 +542,7 @@ static void
 nvme_ctrlr_release(struct nvme_ctrlr *nvme_ctrlr)
 {
 	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	SPDK_DTRACE_PROBE2(bdev_nvme_ctrlr_release, nvme_ctrlr->nbdev_ctrlr->name, nvme_ctrlr->ref);
 
 	assert(nvme_ctrlr->ref > 0);
 	nvme_ctrlr->ref--;
@@ -735,11 +741,19 @@ nvme_io_path_is_failed(struct nvme_io_path *io_path)
 		return true;
 	}
 
-	/* In a full reset sequence, ctrlr is set to unfailed but it is after
-	 * destroying all qpairs. Ctrlr may be still failed even after starting
-	 * a full reset sequence. Hence we check the resetting flag first.
-	 */
+	if (nvme_ctrlr->fast_io_fail_timedout) {
+		return true;
+	}
+
 	if (nvme_ctrlr->resetting) {
+		if (nvme_ctrlr->reconnect_delay_sec != 0) {
+			return false;
+		} else {
+			return true;
+		}
+	}
+
+	if (nvme_ctrlr->reconnect_is_delayed) {
 		return false;
 	}
 
@@ -761,7 +775,7 @@ nvme_ctrlr_is_available(struct nvme_ctrlr *nvme_ctrlr)
 		return false;
 	}
 
-	if (nvme_ctrlr->resetting) {
+	if (nvme_ctrlr->resetting || nvme_ctrlr->reconnect_is_delayed) {
 		return false;
 	}
 
@@ -1064,7 +1078,12 @@ nvme_poll_group_get_ctrlr_channel(struct nvme_poll_group *group,
 static void
 bdev_nvme_destroy_qpair(struct nvme_ctrlr_channel *ctrlr_ch)
 {
+	struct nvme_ctrlr *nvme_ctrlr __attribute__((unused));
+
 	if (ctrlr_ch->qpair != NULL) {
+		nvme_ctrlr = nvme_ctrlr_channel_get_ctrlr(ctrlr_ch);
+		SPDK_DTRACE_PROBE2(bdev_nvme_destroy_qpair, nvme_ctrlr->nbdev_ctrlr->name,
+				   spdk_nvme_qpair_get_id(ctrlr_ch->qpair));
 		spdk_nvme_ctrlr_free_io_qpair(ctrlr_ch->qpair);
 		ctrlr_ch->qpair = NULL;
 	}
@@ -1150,6 +1169,8 @@ bdev_nvme_destruct(void *ctx)
 	struct nvme_bdev *nvme_disk = ctx;
 	struct nvme_ns *nvme_ns, *tmp_nvme_ns;
 
+	SPDK_DTRACE_PROBE2(bdev_nvme_destruct, nvme_disk->nbdev_ctrlr->name, nvme_disk->nsid);
+
 	TAILQ_FOREACH_SAFE(nvme_ns, &nvme_disk->nvme_ns_list, tailq, tmp_nvme_ns) {
 		pthread_mutex_lock(&nvme_ns->ctrlr->mutex);
 
@@ -1206,6 +1227,9 @@ bdev_nvme_create_qpair(struct nvme_ctrlr_channel *ctrlr_ch)
 		return -1;
 	}
 
+	SPDK_DTRACE_PROBE3(bdev_nvme_create_qpair, nvme_ctrlr->nbdev_ctrlr->name,
+			   spdk_nvme_qpair_get_id(ctrlr_ch->qpair), spdk_thread_get_id(nvme_ctrlr->thread));
+
 	assert(ctrlr_ch->group != NULL);
 
 	rc = spdk_nvme_poll_group_add(ctrlr_ch->group->group, qpair);
@@ -1221,6 +1245,8 @@ bdev_nvme_create_qpair(struct nvme_ctrlr_channel *ctrlr_ch)
 	}
 
 	ctrlr_ch->qpair = qpair;
+
+	_bdev_nvme_clear_io_path_cache(ctrlr_ch);
 
 	return 0;
 
@@ -1286,6 +1312,115 @@ bdev_nvme_failover_trid(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 	}
 }
 
+static bool
+bdev_nvme_check_ctrlr_loss_timeout(struct nvme_ctrlr *nvme_ctrlr)
+{
+	int32_t elapsed;
+
+	if (nvme_ctrlr->ctrlr_loss_timeout_sec == 0 ||
+	    nvme_ctrlr->ctrlr_loss_timeout_sec == -1) {
+		return false;
+	}
+
+	elapsed = (spdk_get_ticks() - nvme_ctrlr->reset_start_tsc) / spdk_get_ticks_hz();
+	if (elapsed >= nvme_ctrlr->ctrlr_loss_timeout_sec) {
+		return true;
+	} else {
+		return false;
+	}
+}
+
+static bool
+bdev_nvme_check_fast_io_fail_timeout(struct nvme_ctrlr *nvme_ctrlr)
+{
+	uint32_t elapsed;
+
+	if (nvme_ctrlr->fast_io_fail_timeout_sec == 0) {
+		return false;
+	}
+
+	elapsed = (spdk_get_ticks() - nvme_ctrlr->reset_start_tsc) / spdk_get_ticks_hz();
+	if (elapsed >= nvme_ctrlr->fast_io_fail_timeout_sec) {
+		return true;
+	} else {
+		return false;
+	}
+}
+
+enum bdev_nvme_op_after_reset {
+	OP_NONE,
+	OP_COMPLETE_PENDING_DESTRUCT,
+	OP_DESTRUCT,
+	OP_DELAYED_RECONNECT,
+};
+
+typedef enum bdev_nvme_op_after_reset _bdev_nvme_op_after_reset;
+
+static _bdev_nvme_op_after_reset
+bdev_nvme_check_op_after_reset(struct nvme_ctrlr *nvme_ctrlr, bool success)
+{
+	if (nvme_ctrlr_can_be_unregistered(nvme_ctrlr)) {
+		/* Complete pending destruct after reset completes. */
+		return OP_COMPLETE_PENDING_DESTRUCT;
+	} else if (success || nvme_ctrlr->reconnect_delay_sec == 0) {
+		nvme_ctrlr->reset_start_tsc = 0;
+		return OP_NONE;
+	} else if (bdev_nvme_check_ctrlr_loss_timeout(nvme_ctrlr)) {
+		return OP_DESTRUCT;
+	} else {
+		if (bdev_nvme_check_fast_io_fail_timeout(nvme_ctrlr)) {
+			nvme_ctrlr->fast_io_fail_timedout = true;
+		}
+		bdev_nvme_failover_trid(nvme_ctrlr, false);
+		return OP_DELAYED_RECONNECT;
+	}
+}
+
+static int _bdev_nvme_delete(struct nvme_ctrlr *nvme_ctrlr, bool hotplug);
+static void bdev_nvme_reconnect_ctrlr(struct nvme_ctrlr *nvme_ctrlr);
+
+static int
+bdev_nvme_reconnect_delay_timer_expired(void *ctx)
+{
+	struct nvme_ctrlr *nvme_ctrlr = ctx;
+
+	pthread_mutex_lock(&nvme_ctrlr->mutex);
+
+	spdk_poller_unregister(&nvme_ctrlr->reconnect_delay_timer);
+
+	assert(nvme_ctrlr->reconnect_is_delayed == true);
+	nvme_ctrlr->reconnect_is_delayed = false;
+
+	if (nvme_ctrlr->destruct) {
+		pthread_mutex_unlock(&nvme_ctrlr->mutex);
+		return SPDK_POLLER_BUSY;
+	}
+
+	assert(nvme_ctrlr->resetting == false);
+	nvme_ctrlr->resetting = true;
+
+	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+
+	spdk_poller_resume(nvme_ctrlr->adminq_timer_poller);
+
+	bdev_nvme_reconnect_ctrlr(nvme_ctrlr);
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+bdev_nvme_start_reconnect_delay_timer(struct nvme_ctrlr *nvme_ctrlr)
+{
+	spdk_poller_pause(nvme_ctrlr->adminq_timer_poller);
+
+	assert(nvme_ctrlr->reconnect_is_delayed == false);
+	nvme_ctrlr->reconnect_is_delayed = true;
+
+	assert(nvme_ctrlr->reconnect_delay_timer == NULL);
+	nvme_ctrlr->reconnect_delay_timer = SPDK_POLLER_REGISTER(bdev_nvme_reconnect_delay_timer_expired,
+					    nvme_ctrlr,
+					    nvme_ctrlr->reconnect_delay_sec * SPDK_SEC_TO_USEC);
+}
+
 static void
 _bdev_nvme_reset_complete(struct spdk_io_channel_iter *i, int status)
 {
@@ -1294,7 +1429,7 @@ _bdev_nvme_reset_complete(struct spdk_io_channel_iter *i, int status)
 	struct nvme_path_id *path_id;
 	bdev_nvme_reset_cb reset_cb_fn = nvme_ctrlr->reset_cb_fn;
 	void *reset_cb_arg = nvme_ctrlr->reset_cb_arg;
-	bool complete_pending_destruct = false;
+	enum bdev_nvme_op_after_reset op_after_reset;
 
 	assert(nvme_ctrlr->thread == spdk_get_thread());
 
@@ -1316,10 +1451,7 @@ _bdev_nvme_reset_complete(struct spdk_io_channel_iter *i, int status)
 
 	path_id->is_failed = !success;
 
-	if (nvme_ctrlr_can_be_unregistered(nvme_ctrlr)) {
-		/* Complete pending destruct after reset completes. */
-		complete_pending_destruct = true;
-	}
+	op_after_reset = bdev_nvme_check_op_after_reset(nvme_ctrlr, success);
 
 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
 
@@ -1327,8 +1459,19 @@ _bdev_nvme_reset_complete(struct spdk_io_channel_iter *i, int status)
 		reset_cb_fn(reset_cb_arg, success);
 	}
 
-	if (complete_pending_destruct) {
+	switch (op_after_reset) {
+	case OP_COMPLETE_PENDING_DESTRUCT:
 		nvme_ctrlr_unregister(nvme_ctrlr);
+		break;
+	case OP_DESTRUCT:
+		_bdev_nvme_delete(nvme_ctrlr, false);
+		break;
+	case OP_DELAYED_RECONNECT:
+		spdk_nvme_ctrlr_disconnect(nvme_ctrlr->ctrlr);
+		bdev_nvme_start_reconnect_delay_timer(nvme_ctrlr);
+		break;
+	default:
+		break;
 	}
 }
 
@@ -1390,14 +1533,16 @@ bdev_nvme_reset_create_qpair(struct spdk_io_channel_iter *i)
 }
 
 static int
-bdev_nvme_ctrlr_reset_poll(void *arg)
+bdev_nvme_reconnect_ctrlr_poll(void *arg)
 {
 	struct nvme_ctrlr *nvme_ctrlr = arg;
-	int rc;
+	int rc = -ETIMEDOUT;
 
-	rc = spdk_nvme_ctrlr_reconnect_poll_async(nvme_ctrlr->ctrlr);
-	if (rc == -EAGAIN) {
-		return SPDK_POLLER_BUSY;
+	if (!bdev_nvme_check_ctrlr_loss_timeout(nvme_ctrlr)) {
+		rc = spdk_nvme_ctrlr_reconnect_poll_async(nvme_ctrlr->ctrlr);
+		if (rc == -EAGAIN) {
+			return SPDK_POLLER_BUSY;
+		}
 	}
 
 	spdk_poller_unregister(&nvme_ctrlr->reset_detach_poller);
@@ -1411,6 +1556,16 @@ bdev_nvme_ctrlr_reset_poll(void *arg)
 		bdev_nvme_reset_complete(nvme_ctrlr, false);
 	}
 	return SPDK_POLLER_BUSY;
+}
+
+static void
+bdev_nvme_reconnect_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
+{
+	spdk_nvme_ctrlr_reconnect_async(nvme_ctrlr->ctrlr);
+
+	assert(nvme_ctrlr->reset_detach_poller == NULL);
+	nvme_ctrlr->reset_detach_poller = SPDK_POLLER_REGISTER(bdev_nvme_reconnect_ctrlr_poll,
+					  nvme_ctrlr, 0);
 }
 
 static void
@@ -1428,11 +1583,7 @@ bdev_nvme_reset_ctrlr(struct spdk_io_channel_iter *i, int status)
 	rc = spdk_nvme_ctrlr_disconnect(nvme_ctrlr->ctrlr);
 	assert(rc == 0);
 
-	spdk_nvme_ctrlr_reconnect_async(nvme_ctrlr->ctrlr);
-
-	assert(nvme_ctrlr->reset_detach_poller == NULL);
-	nvme_ctrlr->reset_detach_poller = SPDK_POLLER_REGISTER(bdev_nvme_ctrlr_reset_poll,
-					  nvme_ctrlr, 0);
+	bdev_nvme_reconnect_ctrlr(nvme_ctrlr);
 }
 
 static void
@@ -1467,7 +1618,17 @@ bdev_nvme_reset(struct nvme_ctrlr *nvme_ctrlr)
 		return -EBUSY;
 	}
 
+	if (nvme_ctrlr->reconnect_is_delayed) {
+		pthread_mutex_unlock(&nvme_ctrlr->mutex);
+		SPDK_NOTICELOG("Reconnect is already scheduled.\n");
+		return -EBUSY;
+	}
+
 	nvme_ctrlr->resetting = true;
+
+	assert(nvme_ctrlr->reset_start_tsc == 0);
+	nvme_ctrlr->reset_start_tsc = spdk_get_ticks();
+
 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
 
 	spdk_thread_send_msg(nvme_ctrlr->thread, _bdev_nvme_reset, nvme_ctrlr);
@@ -1618,6 +1779,14 @@ bdev_nvme_failover(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 	}
 
 	bdev_nvme_failover_trid(nvme_ctrlr, remove);
+
+	if (nvme_ctrlr->reconnect_is_delayed) {
+		pthread_mutex_unlock(&nvme_ctrlr->mutex);
+		SPDK_NOTICELOG("Reconnect is already scheduled.\n");
+
+		/* We rely on the next reconnect for the failover. */
+		return 0;
+	}
 
 	nvme_ctrlr->resetting = true;
 
@@ -3237,6 +3406,9 @@ nvme_ctrlr_create(struct spdk_nvme_ctrlr *ctrlr,
 
 	if (ctx != NULL) {
 		nvme_ctrlr->prchk_flags = ctx->prchk_flags;
+		nvme_ctrlr->ctrlr_loss_timeout_sec = ctx->ctrlr_loss_timeout_sec;
+		nvme_ctrlr->reconnect_delay_sec = ctx->reconnect_delay_sec;
+		nvme_ctrlr->fast_io_fail_timeout_sec = ctx->fast_io_fail_timeout_sec;
 	}
 
 	nvme_ctrlr->adminq_timer_poller = SPDK_POLLER_REGISTER(bdev_nvme_poll_adminq, nvme_ctrlr,
@@ -3588,7 +3760,7 @@ _bdev_nvme_add_secondary_trid(struct nvme_ctrlr *nvme_ctrlr,
 	new_trid->is_failed = false;
 
 	TAILQ_FOREACH(tmp_trid, &nvme_ctrlr->trids, link) {
-		if (tmp_trid->is_failed) {
+		if (tmp_trid->is_failed && tmp_trid != nvme_ctrlr->active_path_id) {
 			TAILQ_INSERT_BEFORE(tmp_trid, new_trid, link);
 			return 0;
 		}
@@ -3702,6 +3874,47 @@ bdev_nvme_async_poll(void *arg)
 	return SPDK_POLLER_BUSY;
 }
 
+static bool
+bdev_nvme_check_multipath_params(int32_t ctrlr_loss_timeout_sec,
+				 uint32_t reconnect_delay_sec,
+				 uint32_t fast_io_fail_timeout_sec)
+{
+	if (ctrlr_loss_timeout_sec < -1) {
+		SPDK_ERRLOG("ctrlr_loss_timeout_sec can't be less than -1.\n");
+		return false;
+	} else if (ctrlr_loss_timeout_sec == -1) {
+		if (reconnect_delay_sec == 0) {
+			SPDK_ERRLOG("reconnect_delay_sec can't be 0 if ctrlr_loss_timeout_sec is not 0.\n");
+			return false;
+		} else if (fast_io_fail_timeout_sec != 0 &&
+			   fast_io_fail_timeout_sec < reconnect_delay_sec) {
+			SPDK_ERRLOG("reconnect_delay_sec can't be more than fast_io-fail_timeout_sec.\n");
+			return false;
+		}
+	} else if (ctrlr_loss_timeout_sec != 0) {
+		if (reconnect_delay_sec == 0) {
+			SPDK_ERRLOG("reconnect_delay_sec can't be 0 if ctrlr_loss_timeout_sec is not 0.\n");
+			return false;
+		} else if (reconnect_delay_sec > (uint32_t)ctrlr_loss_timeout_sec) {
+			SPDK_ERRLOG("reconnect_delay_sec can't be more than ctrlr_loss_timeout_sec.\n");
+			return false;
+		} else if (fast_io_fail_timeout_sec != 0) {
+			if (fast_io_fail_timeout_sec < reconnect_delay_sec) {
+				SPDK_ERRLOG("reconnect_delay_sec can't be more than fast_io_fail_timeout_sec.\n");
+				return false;
+			} else if (fast_io_fail_timeout_sec > (uint32_t)ctrlr_loss_timeout_sec) {
+				SPDK_ERRLOG("fast_io_fail_timeout_sec can't be more than ctrlr_loss_timeout_sec.\n");
+				return false;
+			}
+		}
+	} else if (reconnect_delay_sec != 0 || fast_io_fail_timeout_sec != 0) {
+		SPDK_ERRLOG("Both reconnect_delay_sec and fast_io_fail_timeout_sec must be 0 if ctrlr_loss_timeout_sec is 0.\n");
+		return false;
+	}
+
+	return true;
+}
+
 int
 bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 		 const char *base_name,
@@ -3711,7 +3924,10 @@ bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 		 spdk_bdev_create_nvme_fn cb_fn,
 		 void *cb_ctx,
 		 struct spdk_nvme_ctrlr_opts *opts,
-		 bool multipath)
+		 bool multipath,
+		 int32_t ctrlr_loss_timeout_sec,
+		 uint32_t reconnect_delay_sec,
+		 uint32_t fast_io_fail_timeout_sec)
 {
 	struct nvme_probe_skip_entry	*entry, *tmp;
 	struct nvme_async_probe_ctx	*ctx;
@@ -3725,6 +3941,11 @@ bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 		return -EEXIST;
 	}
 
+	if (!bdev_nvme_check_multipath_params(ctrlr_loss_timeout_sec, reconnect_delay_sec,
+					      fast_io_fail_timeout_sec)) {
+		return -EINVAL;
+	}
+
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		return -ENOMEM;
@@ -3736,6 +3957,9 @@ bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 	ctx->cb_ctx = cb_ctx;
 	ctx->prchk_flags = prchk_flags;
 	ctx->trid = *trid;
+	ctx->ctrlr_loss_timeout_sec = ctrlr_loss_timeout_sec;
+	ctx->reconnect_delay_sec = reconnect_delay_sec;
+	ctx->fast_io_fail_timeout_sec = fast_io_fail_timeout_sec;
 
 	if (trid->trtype == SPDK_NVME_TRANSPORT_PCIE) {
 		TAILQ_FOREACH_SAFE(entry, &g_skipped_nvme_ctrlrs, tailq, tmp) {
@@ -3872,6 +4096,403 @@ bdev_nvme_delete(const char *name, const struct nvme_path_id *path_id)
 	return rc;
 }
 
+struct discovery_ctrlr_ctx {
+	char						name[128];
+	struct spdk_nvme_transport_id			trid;
+	struct spdk_nvme_ctrlr_opts			opts;
+	struct spdk_nvmf_discovery_log_page_entry	entry;
+	TAILQ_ENTRY(discovery_ctrlr_ctx)		tailq;
+	struct discovery_ctx				*ctx;
+};
+
+struct discovery_ctx {
+	char					*name;
+	spdk_bdev_nvme_start_discovery_fn	start_cb_fn;
+	spdk_bdev_nvme_stop_discovery_fn	stop_cb_fn;
+	void					*cb_ctx;
+	struct spdk_nvme_probe_ctx		*probe_ctx;
+	struct spdk_nvme_detach_ctx		*detach_ctx;
+	struct spdk_nvme_ctrlr			*ctrlr;
+	struct spdk_poller			*poller;
+	struct spdk_nvme_ctrlr_opts		opts;
+	TAILQ_ENTRY(discovery_ctx)		tailq;
+	TAILQ_HEAD(, discovery_ctrlr_ctx)	ctrlr_ctxs;
+	int					rc;
+	/* Denotes if a discovery is currently in progress for this context.
+	 * That includes connecting to newly discovered subsystems.  Used to
+	 * ensure we do not start a new discovery until an existing one is
+	 * complete.
+	 */
+	bool					in_progress;
+
+	/* Denotes if another discovery is needed after the one in progress
+	 * completes.  Set when we receive an AER completion while a discovery
+	 * is already in progress.
+	 */
+	bool					pending;
+
+	/* Signal to the discovery context poller that it should detach from
+	 * the discovery controller.
+	 */
+	bool					detach;
+
+	struct spdk_thread			*calling_thread;
+	uint32_t				index;
+	uint32_t				attach_in_progress;
+	char					*hostnqn;
+};
+
+TAILQ_HEAD(discovery_ctxs, discovery_ctx);
+static struct discovery_ctxs g_discovery_ctxs = TAILQ_HEAD_INITIALIZER(g_discovery_ctxs);
+
+static void get_discovery_log_page(struct discovery_ctx *ctx);
+
+static void
+free_discovery_ctx(struct discovery_ctx *ctx)
+{
+	free(ctx->hostnqn);
+	free(ctx->name);
+	free(ctx);
+}
+
+static void
+discovery_complete(struct discovery_ctx *ctx)
+{
+	ctx->in_progress = false;
+	if (ctx->pending) {
+		ctx->pending = false;
+		get_discovery_log_page(ctx);
+	}
+}
+
+static void
+build_trid_from_log_page_entry(struct spdk_nvme_transport_id *trid,
+			       struct spdk_nvmf_discovery_log_page_entry *entry)
+{
+	char *space;
+
+	trid->trtype = entry->trtype;
+	trid->adrfam = entry->adrfam;
+	memcpy(trid->traddr, entry->traddr, sizeof(trid->traddr));
+	memcpy(trid->trsvcid, entry->trsvcid, sizeof(trid->trsvcid));
+	memcpy(trid->subnqn, entry->subnqn, sizeof(trid->subnqn));
+
+	/* We want the traddr, trsvcid and subnqn fields to be NULL-terminated.
+	 * But the log page entries typically pad them with spaces, not zeroes.
+	 * So add a NULL terminator to each of these fields at the appropriate
+	 * location.
+	 */
+	space = strchr(trid->traddr, ' ');
+	if (space) {
+		*space = 0;
+	}
+	space = strchr(trid->trsvcid, ' ');
+	if (space) {
+		*space = 0;
+	}
+	space = strchr(trid->subnqn, ' ');
+	if (space) {
+		*space = 0;
+	}
+}
+
+static void
+discovery_attach_controller_done(void *cb_ctx, size_t bdev_count, int rc)
+{
+	struct discovery_ctrlr_ctx *ctrlr_ctx = cb_ctx;
+	struct discovery_ctx *ctx = ctrlr_ctx->ctx;;
+
+	SPDK_DEBUGLOG(bdev_nvme, "attach %s done\n", ctrlr_ctx->name);
+	ctx->attach_in_progress--;
+	if (ctx->attach_in_progress == 0) {
+		discovery_complete(ctx);
+	}
+}
+
+static void
+discovery_log_page_cb(void *cb_arg, int rc, const struct spdk_nvme_cpl *cpl,
+		      struct spdk_nvmf_discovery_log_page *log_page)
+{
+	struct discovery_ctx *ctx = cb_arg;
+	struct discovery_ctrlr_ctx *ctrlr_ctx, *tmp;
+	struct spdk_nvmf_discovery_log_page_entry *new_entry, *old_entry;
+	uint64_t numrec, i;
+	bool found;
+
+	if (rc || spdk_nvme_cpl_is_error(cpl)) {
+		SPDK_ERRLOG("could not get discovery log page\n");
+		return;
+	}
+
+	assert(ctx->attach_in_progress == 0);
+	numrec = from_le64(&log_page->numrec);
+	TAILQ_FOREACH_SAFE(ctrlr_ctx, &ctx->ctrlr_ctxs, tailq, tmp) {
+		found = false;
+		old_entry = &ctrlr_ctx->entry;
+		for (i = 0; i < numrec; i++) {
+			new_entry = &log_page->entries[i];
+			if (!memcmp(old_entry, new_entry, sizeof(*old_entry))) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			struct nvme_path_id path = {};
+
+			SPDK_DEBUGLOG(bdev_nvme, "detach controller\n");
+
+			path.trid = ctrlr_ctx->trid;
+			bdev_nvme_delete(ctrlr_ctx->name, &path);
+			TAILQ_REMOVE(&ctx->ctrlr_ctxs, ctrlr_ctx, tailq);
+			free(ctrlr_ctx);
+		}
+	}
+	for (i = 0; i < numrec; i++) {
+		found = false;
+		new_entry = &log_page->entries[i];
+		TAILQ_FOREACH(ctrlr_ctx, &ctx->ctrlr_ctxs, tailq) {
+			old_entry = &ctrlr_ctx->entry;
+			if (!memcmp(new_entry, old_entry, sizeof(*new_entry))) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			struct discovery_ctrlr_ctx *subnqn_ctx, *new_ctx;
+
+			TAILQ_FOREACH(subnqn_ctx, &ctx->ctrlr_ctxs, tailq) {
+				if (!memcmp(subnqn_ctx->entry.subnqn, new_entry->subnqn,
+					    sizeof(new_entry->subnqn))) {
+					break;
+				}
+			}
+
+			new_ctx = calloc(1, sizeof(*ctrlr_ctx));
+			if (new_ctx == NULL) {
+				SPDK_ERRLOG("could not allocate new ctrlr_ctx\n");
+				break;
+			}
+
+			new_ctx->ctx = ctx;
+			memcpy(&new_ctx->entry, new_entry, sizeof(*new_entry));
+			build_trid_from_log_page_entry(&new_ctx->trid, new_entry);
+			if (subnqn_ctx) {
+				snprintf(new_ctx->name, sizeof(new_ctx->name), "%s", subnqn_ctx->name);
+			} else {
+				snprintf(new_ctx->name, sizeof(new_ctx->name), "%s%d", ctx->name, ctx->index++);
+			}
+			spdk_nvme_ctrlr_get_default_ctrlr_opts(&new_ctx->opts, sizeof(new_ctx->opts));
+			snprintf(new_ctx->opts.hostnqn, sizeof(new_ctx->opts.hostnqn), "%s", ctx->hostnqn);
+			rc = bdev_nvme_create(&new_ctx->trid, new_ctx->name, NULL, 0, 0,
+					      discovery_attach_controller_done, new_ctx,
+					      &new_ctx->opts, true, 0, 0, 0);
+			if (rc == 0) {
+				TAILQ_INSERT_TAIL(&ctx->ctrlr_ctxs, new_ctx, tailq);
+				ctx->attach_in_progress++;
+			} else {
+				SPDK_ERRLOG("bdev_nvme_create failed (%s)\n", spdk_strerror(-rc));
+			}
+		}
+	}
+	free(log_page);
+
+	if (ctx->attach_in_progress == 0) {
+		discovery_complete(ctx);
+	}
+}
+
+static void
+get_discovery_log_page(struct discovery_ctx *ctx)
+{
+	int rc;
+
+	assert(ctx->in_progress == false);
+	ctx->in_progress = true;
+	rc = spdk_nvme_ctrlr_get_discovery_log_page(ctx->ctrlr, discovery_log_page_cb, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("could not get discovery log page\n");
+	}
+	SPDK_DEBUGLOG(bdev_nvme, "sent discovery log page command\n");
+}
+
+static void
+discovery_aer_cb(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct discovery_ctx *ctx = arg;
+	uint32_t log_page_id = (cpl->cdw0 & 0xFF0000) >> 16;
+
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		SPDK_ERRLOG("aer failed\n");
+		return;
+	}
+
+	if (log_page_id != SPDK_NVME_LOG_DISCOVERY) {
+		SPDK_ERRLOG("unexpected log page 0x%x\n", log_page_id);
+		return;
+	}
+
+	SPDK_DEBUGLOG(bdev_nvme, "got aer\n");
+	if (ctx->in_progress) {
+		ctx->pending = true;
+		return;
+	}
+
+	get_discovery_log_page(ctx);
+}
+
+static void
+start_discovery_done(void *cb_ctx)
+{
+	struct discovery_ctx *ctx = cb_ctx;
+
+	SPDK_DEBUGLOG(bdev_nvme, "start discovery done\n");
+	ctx->start_cb_fn(ctx->cb_ctx, ctx->rc);
+	if (ctx->rc != 0) {
+		SPDK_ERRLOG("could not connect to discovery ctrlr\n");
+		TAILQ_REMOVE(&g_discovery_ctxs, ctx, tailq);
+		free_discovery_ctx(ctx);
+	}
+}
+
+static int
+discovery_poller(void *arg)
+{
+	struct discovery_ctx *ctx = arg;
+	int rc;
+
+	if (ctx->probe_ctx) {
+		rc = spdk_nvme_probe_poll_async(ctx->probe_ctx);
+		if (rc != -EAGAIN) {
+			ctx->rc = rc;
+			spdk_thread_send_msg(ctx->calling_thread, start_discovery_done, ctx);
+			if (rc == 0) {
+				get_discovery_log_page(ctx);
+			}
+		}
+	} else if (ctx->detach) {
+		bool detach_done = false;
+
+		if (ctx->detach_ctx == NULL) {
+			rc = spdk_nvme_detach_async(ctx->ctrlr, &ctx->detach_ctx);
+			if (rc != 0) {
+				SPDK_ERRLOG("could not detach discovery ctrlr\n");
+				detach_done = true;
+			}
+		} else {
+			rc = spdk_nvme_detach_poll_async(ctx->detach_ctx);
+			if (rc != -EAGAIN) {
+				detach_done = true;
+			}
+		}
+		if (detach_done) {
+			spdk_poller_unregister(&ctx->poller);
+			TAILQ_REMOVE(&g_discovery_ctxs, ctx, tailq);
+			ctx->stop_cb_fn(ctx->cb_ctx);
+			free_discovery_ctx(ctx);
+		}
+	} else {
+		spdk_nvme_ctrlr_process_admin_completions(ctx->ctrlr);
+	}
+
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+discovery_attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
+		    struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
+{
+	struct spdk_nvme_ctrlr_opts *user_opts = cb_ctx;
+	struct discovery_ctx *ctx;
+
+	ctx = SPDK_CONTAINEROF(user_opts, struct discovery_ctx, opts);
+
+	SPDK_DEBUGLOG(bdev_nvme, "discovery ctrlr attached\n");
+	ctx->probe_ctx = NULL;
+	ctx->ctrlr = ctrlr;
+	spdk_nvme_ctrlr_register_aer_callback(ctx->ctrlr, discovery_aer_cb, ctx);
+}
+
+static void
+start_discovery_poller(void *arg)
+{
+	struct discovery_ctx *ctx = arg;
+
+	TAILQ_INSERT_TAIL(&g_discovery_ctxs, ctx, tailq);
+	ctx->poller = SPDK_POLLER_REGISTER(discovery_poller, ctx, 1000);
+}
+
+int
+bdev_nvme_start_discovery(struct spdk_nvme_transport_id *trid,
+			  const char *base_name,
+			  struct spdk_nvme_ctrlr_opts *opts,
+			  spdk_bdev_nvme_start_discovery_fn cb_fn,
+			  void *cb_ctx)
+{
+	struct discovery_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+
+	ctx->name = strdup(base_name);
+	if (ctx->name == NULL) {
+		free_discovery_ctx(ctx);
+		return -ENOMEM;
+	}
+	ctx->start_cb_fn = cb_fn;
+	ctx->cb_ctx = cb_ctx;
+	memcpy(&ctx->opts, opts, sizeof(*opts));
+	ctx->calling_thread = spdk_get_thread();
+	TAILQ_INIT(&ctx->ctrlr_ctxs);
+	snprintf(trid->subnqn, sizeof(trid->subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
+	/* Even if user did not specify hostnqn, we can still strdup("\0"); */
+	ctx->hostnqn = strdup(ctx->opts.hostnqn);
+	if (ctx->hostnqn == NULL) {
+		free_discovery_ctx(ctx);
+		return -ENOMEM;
+	}
+	ctx->probe_ctx = spdk_nvme_connect_async(trid, &ctx->opts, discovery_attach_cb);
+	if (ctx->probe_ctx == NULL) {
+		SPDK_ERRLOG("could not start discovery connect\n");
+		free_discovery_ctx(ctx);
+		return -EIO;
+	}
+
+	spdk_thread_send_msg(g_bdev_nvme_init_thread, start_discovery_poller, ctx);
+	return 0;
+}
+
+int
+bdev_nvme_stop_discovery(const char *name, spdk_bdev_nvme_stop_discovery_fn cb_fn, void *cb_ctx)
+{
+	struct discovery_ctx *ctx;
+
+	TAILQ_FOREACH(ctx, &g_discovery_ctxs, tailq) {
+		if (strcmp(name, ctx->name) == 0) {
+			if (ctx->detach) {
+				return -EALREADY;
+			}
+			ctx->detach = true;
+			ctx->stop_cb_fn = cb_fn;
+			ctx->cb_ctx = cb_ctx;
+			while (!TAILQ_EMPTY(&ctx->ctrlr_ctxs)) {
+				struct discovery_ctrlr_ctx *ctrlr_ctx;
+				struct nvme_path_id path = {};
+
+				ctrlr_ctx = TAILQ_FIRST(&ctx->ctrlr_ctxs);
+				path.trid = ctrlr_ctx->trid;
+				bdev_nvme_delete(ctrlr_ctx->name, &path);
+				TAILQ_REMOVE(&ctx->ctrlr_ctxs, ctrlr_ctx, tailq);
+				free(ctrlr_ctx);
+			}
+			return 0;
+		}
+	}
+
+	return -ENOENT;
+}
+
 static int
 bdev_nvme_library_init(void)
 {
@@ -3921,9 +4542,18 @@ bdev_nvme_fini_destruct_ctrlrs(void)
 }
 
 static void
+check_discovery_fini(void *arg)
+{
+	if (TAILQ_EMPTY(&g_discovery_ctxs)) {
+		bdev_nvme_fini_destruct_ctrlrs();
+	}
+}
+
+static void
 bdev_nvme_library_fini(void)
 {
 	struct nvme_probe_skip_entry *entry, *entry_tmp;
+	struct discovery_ctx *ctx;
 
 	spdk_poller_unregister(&g_hotplug_poller);
 	free(g_hotplug_probe_ctx);
@@ -3934,7 +4564,15 @@ bdev_nvme_library_fini(void)
 		free(entry);
 	}
 
-	bdev_nvme_fini_destruct_ctrlrs();
+	assert(spdk_get_thread() == g_bdev_nvme_init_thread);
+	if (TAILQ_EMPTY(&g_discovery_ctxs)) {
+		bdev_nvme_fini_destruct_ctrlrs();
+	} else {
+		TAILQ_FOREACH(ctx, &g_discovery_ctxs, tailq) {
+			ctx->detach = true;
+			ctx->stop_cb_fn = check_discovery_fini;
+		}
+	}
 }
 
 static void
@@ -4976,6 +5614,9 @@ nvme_ctrlr_config_json(struct spdk_json_write_ctx *w,
 				   (nvme_ctrlr->prchk_flags & SPDK_NVME_IO_FLAGS_PRCHK_REFTAG) != 0);
 	spdk_json_write_named_bool(w, "prchk_guard",
 				   (nvme_ctrlr->prchk_flags & SPDK_NVME_IO_FLAGS_PRCHK_GUARD) != 0);
+	spdk_json_write_named_int32(w, "ctrlr_loss_timeout_sec", nvme_ctrlr->ctrlr_loss_timeout_sec);
+	spdk_json_write_named_uint32(w, "reconnect_delay_sec", nvme_ctrlr->reconnect_delay_sec);
+	spdk_json_write_named_uint32(w, "fast_io_fail_timeout_sec", nvme_ctrlr->fast_io_fail_timeout_sec);
 
 	spdk_json_write_object_end(w);
 

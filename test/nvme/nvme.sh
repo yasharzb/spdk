@@ -42,11 +42,21 @@ function nvme_fio_test() {
 }
 
 function nvme_multi_secondary() {
-	$SPDK_EXAMPLE_DIR/perf -i 0 -q 16 -w read -o 4096 -t 3 -c 0x1 &
+	# Primary process exits last
+	$SPDK_EXAMPLE_DIR/perf -i 0 -q 16 -w read -o 4096 -t 5 -c 0x1 &
 	pid0=$!
 	$SPDK_EXAMPLE_DIR/perf -i 0 -q 16 -w read -o 4096 -t 3 -c 0x2 &
 	pid1=$!
 	$SPDK_EXAMPLE_DIR/perf -i 0 -q 16 -w read -o 4096 -t 3 -c 0x4
+	wait $pid0
+	wait $pid1
+
+	# Secondary process exits last
+	$SPDK_EXAMPLE_DIR/perf -i 0 -q 16 -w read -o 4096 -t 3 -c 0x1 &
+	pid0=$!
+	$SPDK_EXAMPLE_DIR/perf -i 0 -q 16 -w read -o 4096 -t 3 -c 0x2 &
+	pid1=$!
+	$SPDK_EXAMPLE_DIR/perf -i 0 -q 16 -w read -o 4096 -t 5 -c 0x4
 	wait $pid0
 	wait $pid1
 }
@@ -81,7 +91,7 @@ if [ $(uname) = Linux ]; then
 		# just create a 100MB partition - this tests our ability to detect mountpoints
 		# on partitions of the device, not just the device itself;  it also is faster
 		# since we don't trim and initialize the whole namespace
-		parted -s /dev/$blkname mkpart primary 1 100
+		parted -s /dev/$blkname mkpart SPDK_TEST 1 100
 		sleep 1
 		mkfs.ext4 -F /dev/${blkname}p1
 		mkdir -p /tmp/nvmetest

@@ -45,9 +45,36 @@ struct nvme_discovery_ctx {
 };
 
 static void
+get_log_page_completion_final(void *cb_arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct nvme_discovery_ctx *ctx = cb_arg;
+	int rc;
+
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		free(ctx->log_page);
+		ctx->cb_fn(ctx->cb_arg, 0, cpl, NULL);
+		free(ctx);
+		return;
+	}
+
+	/* Compare original genctr with latest genctr. If it changed, we need to restart. */
+	if (ctx->log_page->genctr == ctx->genctr) {
+		ctx->cb_fn(ctx->cb_arg, 0, cpl, ctx->log_page);
+	} else {
+		free(ctx->log_page);
+		rc = spdk_nvme_ctrlr_get_discovery_log_page(ctx->ctrlr, ctx->cb_fn, ctx->cb_arg);
+		if (rc != 0) {
+			ctx->cb_fn(ctx->cb_arg, rc, NULL, NULL);
+		}
+	}
+	free(ctx);
+}
+
+static void
 get_log_page_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 {
 	struct nvme_discovery_ctx *ctx = cb_arg;
+	int rc;
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
 		/* Only save the cpl for the first error that we encounter. */
@@ -56,18 +83,23 @@ get_log_page_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 		}
 	}
 	ctx->outstanding_commands--;
-	if (ctx->outstanding_commands == 0) {
-		struct spdk_nvmf_discovery_log_page *log_page;
+	if (ctx->outstanding_commands > 0) {
+		return;
+	}
 
-		if (!spdk_nvme_cpl_is_error(&ctx->cpl)) {
-			log_page = ctx->log_page;
-		} else {
-			/* We had an error, so don't return the log page to the caller. */
-			log_page = NULL;
-			free(ctx->log_page);
-		}
+	if (spdk_nvme_cpl_is_error(&ctx->cpl)) {
+		free(ctx->log_page);
+		ctx->cb_fn(ctx->cb_arg, 0, &ctx->cpl, NULL);
+		free(ctx);
+		return;
+	}
 
-		ctx->cb_fn(ctx->cb_arg, 0, &ctx->cpl, log_page);
+	rc = spdk_nvme_ctrlr_cmd_get_log_page(ctx->ctrlr, SPDK_NVME_LOG_DISCOVERY, 0,
+					      &ctx->genctr, sizeof(ctx->genctr), 0,
+					      get_log_page_completion_final, ctx);
+	if (rc != 0) {
+		free(ctx->log_page);
+		ctx->cb_fn(ctx->cb_arg, rc, NULL, NULL);
 		free(ctx);
 	}
 }

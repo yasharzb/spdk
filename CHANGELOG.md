@@ -1,28 +1,47 @@
 # Changelog
 
-## v22.01: (Upcoming Release)
+## v22.05: (Upcoming Release)
+
+## v22.01
 
 ### accel
 
 The batching capability was removed. Batching is now considered an implementation
 detail of the low level drivers.
 
+### idxd
+
+Many APIs are now vectored rather than scalar, meaning they take iovecs instead of individual pointers.
+
 ### nvme
 
 API `spdk_nvme_trtype_is_fabrics` was added to return existing transport type
 is fabric or not.
 
-### bdev_nvme
+API `spdk_nvme_poll_group_remove` was limited to be available only for a
+disconnected qpair in the group.
 
-Added `num_io_queues` to `bdev_nvme_attach_controller` RPC to allow specifying amount
-of requested IO queues.
+### bdev_aio
+
+Added `bdev_aio_rescan` RPC to allow rescaning the size of aio bdev
 
 ### bdev
+
+The NVMe bdev module supports multipath and improved I/O error resiliency.
 
 The parameter `retry_count` of the RPC `bdev_nvme_set_options` was deprecated and will be
 removed in SPDK 22.04, and the parameter `transport_retry_count` is added and used instead.
 
 An new parameter `bdev_retry_count` is added to the RPC `bdev_nvme_set_options`.
+
+New parameters, `ctrlr_loss_timeout_sec`, `reconnect_delay_sec`, and `fast_io_fail_timeout_sec`, are
+added to the RPC `bdev_nvme_attach_controller`.
+
+An new parameter `num_io_queues` is added to `bdev_nvme_attach_controller` RPC to allow specifying amount
+of requested IO queues.
+
+Added 'key_file' parameter to the 'rbd_register_cluster' RPC.  It is an optional parameter to
+specify a keyring file to connect to a RADOS cluster.
 
 ### nvme
 
@@ -40,10 +59,18 @@ they did not account for PCI devices being inserted or removed while the caller 
 returned from these APIs.  Existing users of these APIs should switch to spdk_pci_for_each_device
 instead.
 
+Added 3 experimental APIs to handle PCI device interrupts (`spdk_pci_device_enable_interrupt`,
+`spdk_pci_device_disable_interrupt`, `spdk_pci_device_get_interrupt_efd`).
+
 ### nvmf
 
 Added a 'subsystem' parameter to spdk_nvmf_transport_stop_listen_async. When not NULL,
 it will only disconnect qpairs for controllers associated with the specified subsystem.
+
+### scsi
+
+Structure `spdk_scsi_lun` has been extended with new member `resizing` so that SCSI layer now reports
+unit attention for disk resize.
 
 ## v21.10
 

@@ -32,11 +32,6 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/** \file
- * Set of workarounds for rte_vhost to make it work with device types
- * other than vhost-net.
- */
-
 #include "spdk/stdinc.h"
 
 #include "spdk/env.h"
@@ -50,6 +45,24 @@
 #include <rte_version.h>
 
 #include "spdk_internal/vhost_user.h"
+
+char g_vhost_user_dev_dirname[PATH_MAX] = "";
+sem_t g_dpdk_sem;
+
+static void __attribute__((constructor))
+_vhost_user_sem_init(void)
+{
+	if (sem_init(&g_dpdk_sem, 0, 0) != 0) {
+		SPDK_ERRLOG("Failed to initialize semaphore for rte_vhost pthread.\n");
+		abort();
+	}
+}
+
+static void __attribute__((destructor))
+_vhost_user_sem_destroy(void)
+{
+	sem_destroy(&g_dpdk_sem);
+}
 
 static inline void
 vhost_session_mem_region_calc(uint64_t *previous_start, uint64_t *start, uint64_t *end,
@@ -390,4 +403,88 @@ int
 vhost_get_negotiated_features(int vid, uint64_t *negotiated_features)
 {
 	return rte_vhost_get_negotiated_features(vid, negotiated_features);
+}
+
+int
+vhost_user_dev_set_coalescing(struct spdk_vhost_dev *vdev, uint32_t delay_base_us,
+			 uint32_t iops_threshold)
+{
+	uint64_t delay_time_base = delay_base_us * spdk_get_ticks_hz() / 1000000ULL;
+	uint32_t io_rate = iops_threshold * SPDK_VHOST_STATS_CHECK_INTERVAL_MS / 1000U;
+
+	if (delay_time_base >= UINT32_MAX) {
+		SPDK_ERRLOG("Delay time of %"PRIu32" is to big\n", delay_base_us);
+		return -EINVAL;
+	} else if (io_rate == 0) {
+		SPDK_ERRLOG("IOPS rate of %"PRIu32" is too low. Min is %u\n", io_rate,
+			    1000U / SPDK_VHOST_STATS_CHECK_INTERVAL_MS);
+		return -EINVAL;
+	}
+
+	vdev->coalescing_delay_us = delay_base_us;
+	vdev->coalescing_iops_threshold = iops_threshold;
+	return 0;
+}
+
+int
+vhost_user_session_set_coalescing(struct spdk_vhost_dev *vdev,
+			     struct spdk_vhost_session *vsession, void *ctx)
+{
+	vsession->coalescing_delay_time_base =
+		vdev->coalescing_delay_us * spdk_get_ticks_hz() / 1000000ULL;
+	vsession->coalescing_io_rate_threshold =
+		vdev->coalescing_iops_threshold * SPDK_VHOST_STATS_CHECK_INTERVAL_MS / 1000U;
+	return 0;
+}
+
+int
+spdk_vhost_set_coalescing(struct spdk_vhost_dev *vdev, uint32_t delay_base_us,
+			  uint32_t iops_threshold)
+{
+	int rc;
+
+	rc = vhost_user_dev_set_coalescing(vdev, delay_base_us, iops_threshold);
+	if (rc != 0) {
+		return rc;
+	}
+
+	vhost_dev_foreach_session(vdev, vhost_user_session_set_coalescing, NULL, NULL);
+	return 0;
+}
+
+void
+spdk_vhost_get_coalescing(struct spdk_vhost_dev *vdev, uint32_t *delay_base_us,
+			  uint32_t *iops_threshold)
+{
+	if (delay_base_us) {
+		*delay_base_us = vdev->coalescing_delay_us;
+	}
+
+	if (iops_threshold) {
+		*iops_threshold = vdev->coalescing_iops_threshold;
+	}
+}
+
+int
+spdk_vhost_set_socket_path(const char *basename)
+{
+	int ret;
+
+	if (basename && strlen(basename) > 0) {
+		ret = snprintf(g_vhost_user_dev_dirname, sizeof(g_vhost_user_dev_dirname) - 2, "%s", basename);
+		if (ret <= 0) {
+			return -EINVAL;
+		}
+		if ((size_t)ret >= sizeof(g_vhost_user_dev_dirname) - 2) {
+			SPDK_ERRLOG("Char dev dir path length %d is too long\n", ret);
+			return -EINVAL;
+		}
+
+		if (g_vhost_user_dev_dirname[ret - 1] != '/') {
+			g_vhost_user_dev_dirname[ret] = '/';
+			g_vhost_user_dev_dirname[ret + 1]  = '\0';
+		}
+	}
+
+	return 0;
 }

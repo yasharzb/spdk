@@ -180,6 +180,18 @@ idxd_map_pci_bars(struct spdk_idxd_device *idxd)
 	return 0;
 }
 
+static void
+idxd_disable_dev(struct spdk_idxd_device *idxd)
+{
+	int rc;
+
+	_idxd_write_4(idxd, IDXD_CMD_OFFSET, IDXD_DISABLE_DEV << IDXD_CMD_SHIFT);
+	rc = idxd_wait_cmd(idxd, IDXD_REGISTER_TIMEOUT_US);
+	if (rc < 0) {
+		SPDK_ERRLOG("Error disabling device %u\n", rc);
+	}
+}
+
 static int
 idxd_reset_dev(struct spdk_idxd_device *idxd)
 {
@@ -229,7 +241,7 @@ idxd_group_config(struct spdk_idxd_device *idxd)
 
 		/* Divide BW tokens evenly */
 		idxd->groups[i].grpcfg.flags.tokens_allowed =
-			user_idxd->registers.groupcap.total_tokens / g_user_dev_cfg.num_groups;
+			user_idxd->registers.groupcap.read_bufs / g_user_dev_cfg.num_groups;
 	}
 
 	/*
@@ -261,10 +273,11 @@ idxd_group_config(struct spdk_idxd_device *idxd)
 static int
 idxd_wq_config(struct spdk_user_idxd_device *user_idxd)
 {
-	int i, j;
+	uint32_t i, j;
 	struct idxd_wq *queue;
 	struct spdk_idxd_device *idxd = &user_idxd->idxd;
-	u_int32_t wq_size = user_idxd->registers.wqcap.total_wq_size / g_user_dev_cfg.total_wqs;
+	uint32_t wq_size = user_idxd->registers.wqcap.total_wq_size / g_user_dev_cfg.total_wqs;
+	uint32_t wqcap_size = 1 << (WQCFG_SHIFT + user_idxd->registers.wqcap.wqcfg_size);
 
 	SPDK_DEBUGLOG(idxd, "Total ring slots available space 0x%x, so per work queue is 0x%x\n",
 		      user_idxd->registers.wqcap.total_wq_size, wq_size);
@@ -278,14 +291,21 @@ idxd_wq_config(struct spdk_user_idxd_device *user_idxd)
 	 * and achieve optimal performance for common cases.
 	 */
 	idxd->chan_per_device = (idxd->total_wq_size >= 128) ? 8 : 4;
-	idxd->queues = calloc(1, user_idxd->registers.wqcap.num_wqs * sizeof(struct idxd_wq));
+	idxd->queues = calloc(1, g_user_dev_cfg.total_wqs * sizeof(struct idxd_wq));
 	if (idxd->queues == NULL) {
 		SPDK_ERRLOG("Failed to allocate queue memory\n");
 		return -ENOMEM;
 	}
 
 	for (i = 0; i < g_user_dev_cfg.total_wqs; i++) {
-		queue = &user_idxd->idxd.queues[i];
+		queue = &idxd->queues[i];
+		/* Per spec we need to read in existing values first so we don't zero out something we
+		 * didn't touch when we write the cfg register out below.
+		 */
+		for (j = 0 ; j < (sizeof(union idxd_wqcfg) / sizeof(uint32_t)); j++) {
+			queue->wqcfg.raw[j] = _idxd_read_4(idxd,
+							   user_idxd->wqcfg_offset + i * wqcap_size + j * sizeof(uint32_t));
+		}
 		queue->wqcfg.wq_size = wq_size;
 		queue->wqcfg.mode = WQ_MODE_DEDICATED;
 		queue->wqcfg.max_batch_shift = LOG2_WQ_MAX_BATCH;
@@ -294,17 +314,17 @@ idxd_wq_config(struct spdk_user_idxd_device *user_idxd)
 		queue->wqcfg.priority = WQ_PRIORITY_1;
 
 		/* Not part of the config struct */
-		queue->idxd = &user_idxd->idxd;
+		queue->idxd = idxd;
 		queue->group = &idxd->groups[i % g_user_dev_cfg.num_groups];
 	}
 
 	/*
-	 * Now write the work queue config to the device for all wq space
+	 * Now write the work queue config to the device for configured queues
 	 */
-	for (i = 0 ; i < user_idxd->registers.wqcap.num_wqs; i++) {
+	for (i = 0 ; i < g_user_dev_cfg.total_wqs; i++) {
 		queue = &idxd->queues[i];
-		for (j = 0 ; j < WQCFG_NUM_DWORDS; j++) {
-			_idxd_write_4(idxd, user_idxd->wqcfg_offset + i * 32 + j * 4,
+		for (j = 0 ; j < (sizeof(union idxd_wqcfg) / sizeof(uint32_t)); j++) {
+			_idxd_write_4(idxd, user_idxd->wqcfg_offset + i * wqcap_size + j * sizeof(uint32_t),
 				      queue->wqcfg.raw[j]);
 		}
 	}
@@ -425,6 +445,8 @@ static void
 user_idxd_device_destruct(struct spdk_idxd_device *idxd)
 {
 	struct spdk_user_idxd_device *user_idxd = __user_idxd(idxd);
+
+	idxd_disable_dev(idxd);
 
 	idxd_unmap_pci_bar(idxd, IDXD_MMIO_BAR);
 	idxd_unmap_pci_bar(idxd, IDXD_WQ_BAR);

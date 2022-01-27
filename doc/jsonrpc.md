@@ -949,6 +949,87 @@ Example response:
 }
 ~~~
 
+### trace_set_tpoint_mask {#rpc_trace_set_tpoint_mask}
+
+Enable tracepoint mask on a specific tpoint group. For example "bdev" for bdev trace group,
+and 0x1 to enable the first tracepoint inside the group (BDEV_IO_START). This command will not
+disable already active tracepoints or those not specified in the mask. For a full description
+of all available trace groups, see
+[tracepoint documentation](https://spdk.io/doc/nvmf_tgt_tracepoints.html).
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | bdev, nvmf_rdma, nvmf_tcp, blobfs, scsi, iscsi_conn, ftl
+tpoint_mask             | Required | number      | mask to enable tracepoints inside a group
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "trace_set_tpoint_mask",
+  "id": 1,
+  "params": {
+    "name": "bdev",
+    "tpoint_mask": 0x1
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### trace_clear_tpoint_mask {#rpc_trace_clear_tpoint_mask}
+
+Disable tracepoint mask on a specific tpoint group. For example "bdev" for bdev trace group,
+and 0x1 to disable the first tracepoint inside the group (BDEV_IO_START). For a full description
+of all available trace groups, see
+[tracepoint documentation](https://spdk.io/doc/nvmf_tgt_tracepoints.html).
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | bdev, nvmf_rdma, nvmf_tcp, blobfs, scsi, iscsi_conn, ftl
+tpoint_mask             | Required | number      | mask to diesable tracepoints inside a group
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "trace_clear_tpoint_mask",
+  "id": 1,
+  "params": {
+    "name": "bdev",
+    "tpoint_mask": 0x1
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
 ### trace_get_tpoint_group_mask {#rpc_trace_get_tpoint_group_mask}
 
 Display mask info for every group.
@@ -2732,6 +2813,41 @@ Example response:
 }
 ~~~
 
+### bdev_aio_rescan {#rpc_bdev_aio_rescan}
+
+Rescan the size of @ref bdev_config_aio.
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | Bdev name
+
+#### Example
+
+Example request:
+
+~~json
+{
+  "params": {
+    "name": "Aio0"
+  },
+  "jsonrpc": "2.0",
+  "method": "bdev_aio_rescan",
+  "id": 1
+}
+~~
+
+Example response:
+
+~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~
+
 ### bdev_aio_delete {#rpc_bdev_aio_delete}
 
 Delete @ref bdev_config_aio.
@@ -2875,6 +2991,11 @@ multipathing. This is done by specifying the `name` parameter as an existing con
 path, the hostnqn, hostsvcid, hostaddr, prchk_reftag, and prchk_guard_arguments must not be specified and are assumed
 to have the same value as the existing path.
 
+The parameters, `ctrlr_loss_timeout_sec`, `reconnect_delay_sec`, and `fast_io_fail_timeout_sec`, are mutually dependent.
+If `reconnect_delay_sec` is non-zero, `ctrlr_loss_timeout_sec` has to be -1 or not less than `reconnect_delay_sec`.
+If `reconnect_delay_sec` is zero, `ctrlr_loss_timeout_sec` has to be zero.
+If `fast_io_fail_timeout_sec` is not zero, it has to be not less than `reconnect_delay_sec` and less than `ctrlr_loss_timeout_sec` if `ctrlr_loss_timeout_sec` is not -1.
+
 #### Result
 
 Array of names of newly created bdevs.
@@ -2899,6 +3020,9 @@ ddgst                      | Optional | bool        | Enable TCP data digest
 fabrics_connect_timeout_us | Optional | bool        | Timeout for fabrics connect (in microseconds)
 multipath                  | Optional | string      | Multipathing behavior: disable, failover, multipath. Default is failover.
 num_io_queues              | Optional | uint32_t    | The number of IO queues to request during initialization. Range: (0, UINT16_MAX + 1], Default is 1024.
+ctrlr_loss_timeout_sec     | Optional | number      | Time to wait until ctrlr is reconnected before deleting ctrlr.  -1 means infinite reconnects. 0 means no reconnect.
+reconnect_delay_sec        | Optional | number      | Time to delay a reconnect trial. 0 means no reconnect.
+fast_io_fail_timeout_sec   | Optional | number      | Time to wait until ctrlr is reconnected before failing I/O to ctrlr. 0 means no such timeout.
 
 #### Example
 
@@ -3051,6 +3175,100 @@ Example request:
   "method": "bdev_nvme_reset_controller",
   "params": {
     "name": "Nvme0"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### bdev_nvme_start_discovery {#rpc_bdev_nvme_start_discovery}
+
+Start a discovery service for the discovery subsystem of the specified transport ID.
+
+The discovery service will read the discovery log page for the specified
+discovery subsystem, and automatically attach to any subsystems found in the
+log page. When determining a controller name to use when attaching, it will use
+the 'name' parameter as a prefix, followed by a unique integer for that discovery
+service. If the discovery service identifies a subsystem that has been previously
+attached but is listed with a different path, it will use the same controller name
+as the previous entry, and connect as a multipath.
+
+When the discovery service sees that a subsystem entry has been removed
+from the log page, it will automatically detach from that controller as well.
+
+The 'name' is also used to later stop the discovery service.
+
+#### Parameters
+
+Name                       | Optional | Type        | Description
+-------------------------- | -------- | ----------- | -----------
+name                       | Required | string      | Prefix for NVMe controllers
+trtype                     | Required | string      | NVMe-oF target trtype: rdma or tcp
+traddr                     | Required | string      | NVMe-oF target address: ip
+adrfam                     | Optional | string      | NVMe-oF target adrfam: ipv4, ipv6
+trsvcid                    | Optional | string      | NVMe-oF target trsvcid: port number
+hostnqn                    | Optional | string      | NVMe-oF target hostnqn
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_nvme_start_discovery",
+  "id": 1,
+  "params": {
+    "name": "nvme_auto",
+    "trtype": "tcp",
+    "traddr": "127.0.0.1",
+    "hostnqn": "nqn.2021-12.io.spdk:host1",
+    "adrfam": "ipv4",
+    "trsvcid": "4420"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### bdev_nvme_stop_discovery {#rpc_bdev_nvme_stop_discovery}
+
+Stop a discovery service. This includes detaching any controllers that were
+discovered via the service that is being stopped.
+
+#### Parameters
+
+Name                       | Optional | Type        | Description
+-------------------------- | -------- | ----------- | -----------
+name                       | Required | string      | Name of service to stop
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_nvme_stop_discovery",
+  "id": 1,
+  "params": {
+    "name": "nvme_auto"
   }
 }
 ~~~
@@ -3431,20 +3649,26 @@ name                    | Required | string      | Registerd Rados cluster objec
 user_id                 | Optional | string      | Ceph ID (i.e. admin, not client.admin)
 config_param            | Optional | string map  | Explicit librados configuration
 config_file             | Optional | string      | File path of libraodos configuration file
+key_file                | Optional | string      | File path of libraodos key file
 
 This RPC registers a Rados Cluster object handle which is only known
-to rbd module, it uses user_id + config_param or user_id + config_file to
-identify a Rados cluster object.
-
-If no config_param is specified, Ceph configuration files must exist with
-all relevant settings for accessing the Ceph cluster. If a config map is
-passed, the configuration files are ignored and instead all key/value
-pairs are passed to rados_conf_set to configure cluster access. In
-practice, "mon_host" (= list of monitor address+port) and "key" (= the
-secret key stored in Ceph keyrings) are enough.
+to rbd module, it uses user_id + config_param or user_id + config_file +
+key_file or user_id + config_param + config_file + key_file to identify
+a Rados cluster object.
 
 When accessing the Ceph cluster as some user other than "admin" (the
 default), the "user_id" has to be set.
+
+The configuration items and secret key can be specified by setting config_param,
+config_file and key_file, all of them, or none of them. If only config_param is
+passed, all key/value pairs are passed to rados_conf_set to configure cluster access.
+In practice, "mon_host" (= list of monitor address+port) and "key" (= the secret key
+stored in Ceph keyrings) are enough. If config_file and key_file are specified, they must
+exist with all relevant settings for accessing the Ceph cluster. If config_param, config_file
+and key_file are specified, get the key/value pairs from config_file first and set to
+rados_conf_set function, then set pairs in config_param and keyring in key_file. If nothing
+is specified, it will get configuration file and key file from the default location
+/etc/ceph/ceph.conf and /etc/ceph/ceph.client.user_id.keyring.
 
 #### Result
 
@@ -3452,16 +3676,15 @@ Name of newly created Rados cluster object.
 
 #### Example
 
-Example request with `key` from `/etc/ceph/ceph.client.admin.keyring`:
+Example request:
 
 ~~
 {
   "params": {
     "name": "rbd_cluster",
-    "config_param": {
-      "mon_host": "192.168.7.1:6789,192.168.7.2:6789",
-      "key": "AQDwf8db7zR1GRAA5k7NKXjS5S5V4mntwUDnGQ==",
-    }
+    "user_id": cinder,
+    "config_file": "/root/ceph_conf/ceph.conf",
+    "key_file": "/root/ceph_conf/ceph.client.cinder.keyring"
   },
   "jsonrpc": "2.0",
   "method": "bdev_rbd_register_cluster",

@@ -59,14 +59,34 @@ verify_request_fn_t verify_fn;
 
 static const uint32_t expected_geometry_ns = 1;
 
+static int
+nvme_ns_cmp(struct spdk_nvme_ns *ns1, struct spdk_nvme_ns *ns2)
+{
+	return ns1->id - ns2->id;
+}
+
+RB_GENERATE_STATIC(nvme_ns_tree, spdk_nvme_ns, node, nvme_ns_cmp);
+
+static struct spdk_nvme_ns g_inactive_ns = {};
+
 struct spdk_nvme_ns *
 spdk_nvme_ctrlr_get_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
 {
-	if (nsid < 1 || nsid > ctrlr->num_ns) {
+	struct spdk_nvme_ns tmp;
+	struct spdk_nvme_ns *ns;
+
+	if (nsid < 1 || nsid > ctrlr->cdata.nn) {
 		return NULL;
 	}
 
-	return &ctrlr->ns[nsid - 1];
+	tmp.id = nsid;
+	ns = RB_FIND(nvme_ns_tree, &ctrlr->ns, &tmp);
+
+	if (ns == NULL) {
+		return &g_inactive_ns;
+	}
+
+	return ns;
 }
 
 int
@@ -113,11 +133,14 @@ test_spdk_nvme_ctrlr_is_ocssd_supported(void)
 	struct spdk_nvme_ns ns = {};
 	bool rc;
 
+	RB_INIT(&ctrlr.ns);
+	ns.id = 1;
+	RB_INSERT(nvme_ns_tree, &ctrlr.ns, &ns);
+
 	ns.nsdata.vendor_specific[0] = 1;
-	ctrlr.ns = &ns;
 	ctrlr.quirks |= NVME_QUIRK_OCSSD;
 	ctrlr.cdata.vid = SPDK_PCI_VID_CNEXLABS;
-	ctrlr.num_ns = 1;
+	ctrlr.cdata.nn = 1;
 
 	rc = spdk_nvme_ctrlr_is_ocssd_supported(&ctrlr);
 	CU_ASSERT(rc == true);
@@ -129,7 +152,7 @@ test_spdk_nvme_ctrlr_is_ocssd_supported(void)
 	CU_ASSERT(rc == false);
 
 	/* NS count is 0. */
-	ctrlr.num_ns = 0;
+	ctrlr.cdata.nn = 0;
 
 	rc = spdk_nvme_ctrlr_is_ocssd_supported(&ctrlr);
 	CU_ASSERT(rc == false);

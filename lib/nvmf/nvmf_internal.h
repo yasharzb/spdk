@@ -268,6 +268,8 @@ struct spdk_nvmf_ctrlr {
 	struct spdk_poller		*association_timer;
 
 	struct spdk_poller		*cc_timer;
+	uint64_t			cc_timeout_tsc;
+	struct spdk_poller		*cc_timeout_timer;
 
 	bool				dif_insert_or_strip;
 	bool				in_destruct;
@@ -279,6 +281,29 @@ struct spdk_nvmf_ctrlr {
 
 	TAILQ_ENTRY(spdk_nvmf_ctrlr)	link;
 };
+
+/* Maximum pending AERs that can be migrated */
+#define NVMF_MIGR_MAX_PENDING_AERS 256
+
+/* spdk_nvmf_ctrlr private migration data structure used to save/restore a controller */
+struct nvmf_ctrlr_migr_data {
+	uint32_t				opts_size;
+
+	uint16_t				cntlid;
+	uint8_t					reserved1[2];
+
+	struct spdk_nvmf_ctrlr_feat		feat;
+	uint32_t				reserved2[2];
+
+	uint32_t				num_async_events;
+	uint32_t				acre_enabled;
+	uint64_t				notice_aen_mask;
+	union spdk_nvme_async_event_completion	async_events[NVMF_MIGR_MAX_PENDING_AERS];
+
+	/* New fields shouldn't go after reserved3 */
+	uint8_t					reserved3[3000];
+};
+SPDK_STATIC_ASSERT(sizeof(struct nvmf_ctrlr_migr_data) == 0x1000, "Incorrect size");
 
 #define NVMF_MAX_LISTENERS_PER_SUBSYSTEM	16
 
@@ -447,6 +472,19 @@ void nvmf_ctrlr_reservation_notice_log(struct spdk_nvmf_ctrlr *ctrlr,
  * the host to send a subsequent AER.
  */
 void nvmf_ctrlr_abort_aer(struct spdk_nvmf_ctrlr *ctrlr);
+int nvmf_ctrlr_save_aers(struct spdk_nvmf_ctrlr *ctrlr, uint16_t *aer_cids,
+			 uint16_t max_aers);
+
+int nvmf_ctrlr_save_migr_data(struct spdk_nvmf_ctrlr *ctrlr, struct nvmf_ctrlr_migr_data *data);
+int nvmf_ctrlr_restore_migr_data(struct spdk_nvmf_ctrlr *ctrlr, struct nvmf_ctrlr_migr_data *data);
+
+/*
+ * Abort zero-copy requests that already got the buffer (received zcopy_start cb), but haven't
+ * started zcopy_end.  These requests are kept on the outstanding queue, but are not waiting for a
+ * completion from the bdev layer, so, when a qpair is being disconnected, we need to kick them to
+ * force their completion.
+ */
+void nvmf_qpair_abort_pending_zcopy_reqs(struct spdk_nvmf_qpair *qpair);
 
 /*
  * Free aer simply frees the rdma resources for the aer without informing the host.

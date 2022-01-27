@@ -117,10 +117,9 @@ nvmf_tgt_create_poll_group(void *io_device, void *ctx_buf)
 	uint32_t sid;
 	int rc;
 
-	SPDK_DTRACE_PROBE1(nvmf_create_poll_group, spdk_thread_get_id(thread));
-
 	TAILQ_INIT(&group->tgroups);
 	TAILQ_INIT(&group->qpairs);
+	group->thread = thread;
 
 	TAILQ_FOREACH(transport, &tgt->transports, link) {
 		rc = nvmf_poll_group_add_transport(group, transport);
@@ -154,7 +153,8 @@ nvmf_tgt_create_poll_group(void *io_device, void *ctx_buf)
 	pthread_mutex_unlock(&tgt->mutex);
 
 	group->poller = SPDK_POLLER_REGISTER(nvmf_poll_group_poll, group, 0);
-	group->thread = thread;
+
+	SPDK_DTRACE_PROBE1(nvmf_create_poll_group, spdk_thread_get_id(thread));
 
 	return 0;
 }
@@ -754,6 +754,8 @@ void spdk_nvmf_tgt_add_transport(struct spdk_nvmf_tgt *tgt,
 {
 	struct spdk_nvmf_tgt_add_transport_ctx *ctx;
 
+	SPDK_DTRACE_PROBE2(nvmf_tgt_add_transport, transport, tgt->name);
+
 	if (spdk_nvmf_tgt_get_transport(tgt, transport->ops->name)) {
 		cb_fn(cb_arg, -EEXIST);
 		return; /* transport already created */
@@ -937,26 +939,6 @@ _nvmf_ctrlr_destruct(void *ctx)
 }
 
 static void
-_nvmf_transport_qpair_fini_complete(void *cb_ctx)
-{
-	struct nvmf_qpair_disconnect_ctx *qpair_ctx = cb_ctx;
-
-	if (qpair_ctx->cb_fn) {
-		spdk_thread_send_msg(qpair_ctx->thread, qpair_ctx->cb_fn, qpair_ctx->ctx);
-	}
-	free(qpair_ctx);
-}
-
-static void
-_nvmf_transport_qpair_fini(void *ctx)
-{
-	struct nvmf_qpair_disconnect_ctx *qpair_ctx = ctx;
-
-	spdk_nvmf_poll_group_remove(qpair_ctx->qpair);
-	nvmf_transport_qpair_fini(qpair_ctx->qpair, _nvmf_transport_qpair_fini_complete, qpair_ctx);
-}
-
-static void
 _nvmf_ctrlr_free_from_qpair(void *ctx)
 {
 	struct nvmf_qpair_disconnect_ctx *qpair_ctx = ctx;
@@ -967,11 +949,47 @@ _nvmf_ctrlr_free_from_qpair(void *ctx)
 	count = spdk_bit_array_count_set(ctrlr->qpair_mask);
 	if (count == 0) {
 		assert(!ctrlr->in_destruct);
+		SPDK_DEBUGLOG(nvmf, "Last qpair %u, destroy ctrlr 0x%hx\n", qpair_ctx->qid, ctrlr->cntlid);
 		ctrlr->in_destruct = true;
 		spdk_thread_send_msg(ctrlr->subsys->thread, _nvmf_ctrlr_destruct, ctrlr);
 	}
+	free(qpair_ctx);
+}
 
-	spdk_thread_send_msg(qpair_ctx->thread, _nvmf_transport_qpair_fini, qpair_ctx);
+static void
+_nvmf_transport_qpair_fini_complete(void *cb_ctx)
+{
+	struct nvmf_qpair_disconnect_ctx *qpair_ctx = cb_ctx;
+	struct spdk_nvmf_ctrlr *ctrlr;
+	/* Store cb args since cb_ctx can be freed in _nvmf_ctrlr_free_from_qpair */
+	nvmf_qpair_disconnect_cb cb_fn = qpair_ctx->cb_fn;
+	void *cb_arg = qpair_ctx->ctx;
+	struct spdk_thread *cb_thread = qpair_ctx->thread;
+
+	ctrlr = qpair_ctx->ctrlr;
+	SPDK_DEBUGLOG(nvmf, "Finish destroying qid %u\n", qpair_ctx->qid);
+
+	if (ctrlr) {
+		if (qpair_ctx->qid == 0) {
+			/* Admin qpair is removed, so set the pointer to NULL.
+			 * This operation is safe since we are on ctrlr thread now, admin qpair's thread is the same
+			 * as controller's thread */
+			assert(ctrlr->thread == spdk_get_thread());
+			ctrlr->admin_qpair = NULL;
+		}
+		/* Free qpair id from controller's bit mask and destroy the controller if it is the last qpair */
+		if (ctrlr->thread) {
+			spdk_thread_send_msg(ctrlr->thread, _nvmf_ctrlr_free_from_qpair, qpair_ctx);
+		} else {
+			_nvmf_ctrlr_free_from_qpair(qpair_ctx);
+		}
+	} else {
+		free(qpair_ctx);
+	}
+
+	if (cb_fn) {
+		spdk_thread_send_msg(cb_thread, cb_fn, cb_arg);
+	}
 }
 
 void
@@ -1032,14 +1050,9 @@ _nvmf_qpair_destroy(void *ctx, int status)
 		}
 	}
 
-	if (!ctrlr || !ctrlr->thread) {
-		spdk_nvmf_poll_group_remove(qpair);
-		nvmf_transport_qpair_fini(qpair, _nvmf_transport_qpair_fini_complete, qpair_ctx);
-		return;
-	}
-
 	qpair_ctx->ctrlr = ctrlr;
-	spdk_thread_send_msg(ctrlr->thread, _nvmf_ctrlr_free_from_qpair, qpair_ctx);
+	spdk_nvmf_poll_group_remove(qpair);
+	nvmf_transport_qpair_fini(qpair, _nvmf_transport_qpair_fini_complete, qpair_ctx);
 }
 
 static void
@@ -1110,6 +1123,7 @@ spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair, nvmf_qpair_disconnect_
 		SPDK_DTRACE_PROBE2(nvmf_poll_group_drain_qpair, qpair, spdk_thread_get_id(group->thread));
 		qpair->state_cb = _nvmf_qpair_destroy;
 		qpair->state_cb_arg = qpair_ctx;
+		nvmf_qpair_abort_pending_zcopy_reqs(qpair);
 		nvmf_qpair_free_aer(qpair);
 		return 0;
 	}
@@ -1158,6 +1172,7 @@ nvmf_poll_group_add_transport(struct spdk_nvmf_poll_group *group,
 		SPDK_ERRLOG("Unable to create poll group for transport\n");
 		return -1;
 	}
+	SPDK_DTRACE_PROBE2(nvmf_transport_poll_group_create, transport, spdk_thread_get_id(group->thread));
 
 	tgroup->group = group;
 	TAILQ_INSERT_TAIL(&group->tgroups, tgroup, link);
@@ -1365,6 +1380,9 @@ fini:
 		cb_fn(cb_arg, rc);
 	}
 
+	SPDK_DTRACE_PROBE2(nvmf_poll_group_add_subsystem, spdk_thread_get_id(group->thread),
+			   subsystem->subnqn);
+
 	return rc;
 }
 
@@ -1481,6 +1499,9 @@ nvmf_poll_group_remove_subsystem(struct spdk_nvmf_poll_group *group,
 	struct nvmf_qpair_disconnect_many_ctx *ctx;
 	uint32_t i;
 
+	SPDK_DTRACE_PROBE3(nvmf_poll_group_remove_subsystem, group, spdk_thread_get_id(group->thread),
+			   subsystem->subnqn);
+
 	ctx = calloc(1, sizeof(struct nvmf_qpair_disconnect_many_ctx));
 	if (!ctx) {
 		SPDK_ERRLOG("Unable to allocate memory for context to remove poll subsystem\n");
@@ -1591,8 +1612,12 @@ nvmf_poll_group_resume_subsystem(struct spdk_nvmf_poll_group *group,
 	/* Release all queued requests */
 	TAILQ_FOREACH_SAFE(req, &sgroup->queued, link, tmp) {
 		TAILQ_REMOVE(&sgroup->queued, req, link);
-		assert(req->zcopy_phase == NVMF_ZCOPY_PHASE_NONE);
-		spdk_nvmf_request_exec(req);
+		if (spdk_nvmf_request_using_zcopy(req)) {
+			spdk_nvmf_request_zcopy_start(req);
+		} else {
+			spdk_nvmf_request_exec(req);
+		}
+
 	}
 fini:
 	if (cb_fn) {

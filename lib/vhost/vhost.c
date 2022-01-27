@@ -46,20 +46,10 @@ bool g_packed_ring_recovery = false;
 
 static struct spdk_cpuset g_vhost_core_mask;
 
-/* Path to folder where character device will be created. Can be set by user. */
-static char dev_dirname[PATH_MAX] = "";
-
 /* Thread performing all vhost management operations */
 static struct spdk_thread *g_vhost_init_thread;
 
 static spdk_vhost_fini_cb g_fini_cpl_cb;
-
-/**
- * DPDK calls our callbacks synchronously but the work those callbacks
- * perform needs to be async. Luckily, all DPDK callbacks are called on
- * a DPDK-internal pthread, so we'll just wait on a semaphore in there.
- */
-static sem_t g_dpdk_sem;
 
 /** Return code for the current DPDK callback */
 static int g_dpdk_response;
@@ -484,66 +474,6 @@ vhost_session_used_signal(struct spdk_vhost_session *vsession)
 	}
 }
 
-static int
-vhost_session_set_coalescing(struct spdk_vhost_dev *vdev,
-			     struct spdk_vhost_session *vsession, void *ctx)
-{
-	vsession->coalescing_delay_time_base =
-		vdev->coalescing_delay_us * spdk_get_ticks_hz() / 1000000ULL;
-	vsession->coalescing_io_rate_threshold =
-		vdev->coalescing_iops_threshold * SPDK_VHOST_STATS_CHECK_INTERVAL_MS / 1000U;
-	return 0;
-}
-
-static int
-vhost_dev_set_coalescing(struct spdk_vhost_dev *vdev, uint32_t delay_base_us,
-			 uint32_t iops_threshold)
-{
-	uint64_t delay_time_base = delay_base_us * spdk_get_ticks_hz() / 1000000ULL;
-	uint32_t io_rate = iops_threshold * SPDK_VHOST_STATS_CHECK_INTERVAL_MS / 1000U;
-
-	if (delay_time_base >= UINT32_MAX) {
-		SPDK_ERRLOG("Delay time of %"PRIu32" is to big\n", delay_base_us);
-		return -EINVAL;
-	} else if (io_rate == 0) {
-		SPDK_ERRLOG("IOPS rate of %"PRIu32" is too low. Min is %u\n", io_rate,
-			    1000U / SPDK_VHOST_STATS_CHECK_INTERVAL_MS);
-		return -EINVAL;
-	}
-
-	vdev->coalescing_delay_us = delay_base_us;
-	vdev->coalescing_iops_threshold = iops_threshold;
-	return 0;
-}
-
-int
-spdk_vhost_set_coalescing(struct spdk_vhost_dev *vdev, uint32_t delay_base_us,
-			  uint32_t iops_threshold)
-{
-	int rc;
-
-	rc = vhost_dev_set_coalescing(vdev, delay_base_us, iops_threshold);
-	if (rc != 0) {
-		return rc;
-	}
-
-	vhost_dev_foreach_session(vdev, vhost_session_set_coalescing, NULL, NULL);
-	return 0;
-}
-
-void
-spdk_vhost_get_coalescing(struct spdk_vhost_dev *vdev, uint32_t *delay_base_us,
-			  uint32_t *iops_threshold)
-{
-	if (delay_base_us) {
-		*delay_base_us = vdev->coalescing_delay_us;
-	}
-
-	if (iops_threshold) {
-		*iops_threshold = vdev->coalescing_iops_threshold;
-	}
-}
-
 /*
  * Enqueue id and len to used ring.
  */
@@ -844,7 +774,8 @@ vhost_session_find_by_vid(int vid)
 	struct spdk_vhost_dev *vdev;
 	struct spdk_vhost_session *vsession;
 
-	TAILQ_FOREACH(vdev, &g_vhost_devices, tailq) {
+	for (vdev = spdk_vhost_dev_next(NULL); vdev != NULL;
+	     vdev = spdk_vhost_dev_next(vdev)) {
 		TAILQ_FOREACH(vsession, &vdev->vsessions, tailq) {
 			if (vsession->vid == vid) {
 				return vsession;
@@ -869,11 +800,6 @@ struct spdk_vhost_dev *
 spdk_vhost_dev_find(const char *ctrlr_name)
 {
 	struct spdk_vhost_dev *vdev;
-	size_t dev_dirname_len = strlen(dev_dirname);
-
-	if (strncmp(ctrlr_name, dev_dirname, dev_dirname_len) == 0) {
-		ctrlr_name += dev_dirname_len;
-	}
 
 	TAILQ_FOREACH(vdev, &g_vhost_devices, tailq) {
 		if (strcmp(vdev->name, ctrlr_name) == 0) {
@@ -957,9 +883,9 @@ vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const char *ma
 		return -EEXIST;
 	}
 
-	if (snprintf(path, sizeof(path), "%s%s", dev_dirname, name) >= (int)sizeof(path)) {
-		SPDK_ERRLOG("Resulting socket path for controller %s is too long: %s%s\n", name, dev_dirname,
-			    name);
+	if (snprintf(path, sizeof(path), "%s%s", g_vhost_user_dev_dirname, name) >= (int)sizeof(path)) {
+		SPDK_ERRLOG("Resulting socket path for controller %s is too long: %s%s\n",
+			    name, g_vhost_user_dev_dirname,  name);
 		return -EINVAL;
 	}
 
@@ -981,8 +907,8 @@ vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const char *ma
 	vdev->backend = backend;
 	TAILQ_INIT(&vdev->vsessions);
 
-	vhost_dev_set_coalescing(vdev, SPDK_VHOST_COALESCING_DELAY_BASE_US,
-				 SPDK_VHOST_VQ_IOPS_COALESCING_THRESHOLD);
+	vhost_user_dev_set_coalescing(vdev, SPDK_VHOST_COALESCING_DELAY_BASE_US,
+				      SPDK_VHOST_VQ_IOPS_COALESCING_THRESHOLD);
 
 	if (vhost_register_unix_socket(path, name, vdev->virtio_features, vdev->disabled_features,
 				       vdev->protocol_features)) {
@@ -1095,14 +1021,14 @@ vhost_event_cb(void *arg1)
 	struct vhost_session_fn_ctx *ctx = arg1;
 	struct spdk_vhost_session *vsession;
 
-	if (pthread_mutex_trylock(&g_vhost_mutex) != 0) {
+	if (spdk_vhost_trylock() != 0) {
 		spdk_thread_send_msg(spdk_get_thread(), vhost_event_cb, arg1);
 		return;
 	}
 
 	vsession = vhost_session_find_by_id(ctx->vdev, ctx->vsession_id);
 	ctx->cb_fn(ctx->vdev, vsession, NULL);
-	pthread_mutex_unlock(&g_vhost_mutex);
+	spdk_vhost_unlock();
 }
 
 int
@@ -1119,9 +1045,9 @@ vhost_session_send_event(struct spdk_vhost_session *vsession,
 
 	spdk_thread_send_msg(vdev->thread, vhost_event_cb, &ev_ctx);
 
-	pthread_mutex_unlock(&g_vhost_mutex);
+	spdk_vhost_unlock();
 	wait_for_semaphore(timeout_sec, errmsg);
-	pthread_mutex_lock(&g_vhost_mutex);
+	spdk_vhost_lock();
 
 	return g_dpdk_response;
 }
@@ -1132,7 +1058,7 @@ foreach_session_finish_cb(void *arg1)
 	struct vhost_session_fn_ctx *ev_ctx = arg1;
 	struct spdk_vhost_dev *vdev = ev_ctx->vdev;
 
-	if (pthread_mutex_trylock(&g_vhost_mutex) != 0) {
+	if (spdk_vhost_trylock() != 0) {
 		spdk_thread_send_msg(spdk_get_thread(),
 				     foreach_session_finish_cb, arg1);
 		return;
@@ -1144,7 +1070,7 @@ foreach_session_finish_cb(void *arg1)
 		ev_ctx->cpl_fn(vdev, ev_ctx->user_ctx);
 	}
 
-	pthread_mutex_unlock(&g_vhost_mutex);
+	spdk_vhost_unlock();
 	free(ev_ctx);
 }
 
@@ -1156,7 +1082,7 @@ foreach_session(void *arg1)
 	struct spdk_vhost_dev *vdev = ev_ctx->vdev;
 	int rc;
 
-	if (pthread_mutex_trylock(&g_vhost_mutex) != 0) {
+	if (spdk_vhost_trylock() != 0) {
 		spdk_thread_send_msg(spdk_get_thread(), foreach_session, arg1);
 		return;
 	}
@@ -1171,7 +1097,7 @@ foreach_session(void *arg1)
 	}
 
 out:
-	pthread_mutex_unlock(&g_vhost_mutex);
+	spdk_vhost_unlock();
 
 	spdk_thread_send_msg(g_vhost_init_thread, foreach_session_finish_cb, arg1);
 }
@@ -1251,22 +1177,22 @@ vhost_stop_device_cb(int vid)
 	struct spdk_vhost_session *vsession;
 	int rc;
 
-	pthread_mutex_lock(&g_vhost_mutex);
+	spdk_vhost_lock();
 	vsession = vhost_session_find_by_vid(vid);
 	if (vsession == NULL) {
 		SPDK_ERRLOG("Couldn't find session with vid %d.\n", vid);
-		pthread_mutex_unlock(&g_vhost_mutex);
+		spdk_vhost_unlock();
 		return -EINVAL;
 	}
 
 	if (!vsession->started) {
 		/* already stopped, nothing to do */
-		pthread_mutex_unlock(&g_vhost_mutex);
+		spdk_vhost_unlock();
 		return -EALREADY;
 	}
 
 	rc = _stop_session(vsession);
-	pthread_mutex_unlock(&g_vhost_mutex);
+	spdk_vhost_unlock();
 
 	return rc;
 }
@@ -1280,7 +1206,7 @@ vhost_start_device_cb(int vid)
 	uint16_t i;
 	bool packed_ring;
 
-	pthread_mutex_lock(&g_vhost_mutex);
+	spdk_vhost_lock();
 
 	vsession = vhost_session_find_by_vid(vid);
 	if (vsession == NULL) {
@@ -1389,7 +1315,7 @@ vhost_start_device_cb(int vid)
 		}
 	}
 
-	vhost_session_set_coalescing(vdev, vsession, NULL);
+	vhost_user_session_set_coalescing(vdev, vsession, NULL);
 	vhost_session_mem_register(vsession->mem);
 	vsession->initialized = true;
 	rc = vdev->backend->start_session(vsession);
@@ -1400,7 +1326,7 @@ vhost_start_device_cb(int vid)
 	}
 
 out:
-	pthread_mutex_unlock(&g_vhost_mutex);
+	spdk_vhost_unlock();
 	return rc;
 }
 
@@ -1452,30 +1378,6 @@ vhost_session_set_interrupt_mode(struct spdk_vhost_session *vsession, bool inter
 	}
 }
 
-int
-spdk_vhost_set_socket_path(const char *basename)
-{
-	int ret;
-
-	if (basename && strlen(basename) > 0) {
-		ret = snprintf(dev_dirname, sizeof(dev_dirname) - 2, "%s", basename);
-		if (ret <= 0) {
-			return -EINVAL;
-		}
-		if ((size_t)ret >= sizeof(dev_dirname) - 2) {
-			SPDK_ERRLOG("Char dev dir path length %d is too long\n", ret);
-			return -EINVAL;
-		}
-
-		if (dev_dirname[ret - 1] != '/') {
-			dev_dirname[ret] = '/';
-			dev_dirname[ret + 1]  = '\0';
-		}
-	}
-
-	return 0;
-}
-
 void
 vhost_dump_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w)
 {
@@ -1498,13 +1400,19 @@ vhost_new_connection_cb(int vid, const char *ifname)
 {
 	struct spdk_vhost_dev *vdev;
 	struct spdk_vhost_session *vsession;
+	size_t dev_dirname_len;
 
-	pthread_mutex_lock(&g_vhost_mutex);
+	spdk_vhost_lock();
+
+	dev_dirname_len = strlen(g_vhost_user_dev_dirname);
+	if (strncmp(ifname, g_vhost_user_dev_dirname, dev_dirname_len) == 0) {
+		ifname += dev_dirname_len;
+	}
 
 	vdev = spdk_vhost_dev_find(ifname);
 	if (vdev == NULL) {
 		SPDK_ERRLOG("Couldn't find device with vid %d to create connection for.\n", vid);
-		pthread_mutex_unlock(&g_vhost_mutex);
+		spdk_vhost_unlock();
 		return -1;
 	}
 
@@ -1521,7 +1429,7 @@ vhost_new_connection_cb(int vid, const char *ifname)
 	if (posix_memalign((void **)&vsession, SPDK_CACHE_LINE_SIZE, sizeof(*vsession) +
 			   vdev->backend->session_ctx_size)) {
 		SPDK_ERRLOG("vsession alloc failed\n");
-		pthread_mutex_unlock(&g_vhost_mutex);
+		spdk_vhost_unlock();
 		return -1;
 	}
 	memset(vsession, 0, sizeof(*vsession) + vdev->backend->session_ctx_size);
@@ -1532,7 +1440,7 @@ vhost_new_connection_cb(int vid, const char *ifname)
 	vsession->name = spdk_sprintf_alloc("%ss%u", vdev->name, vsession->vid);
 	if (vsession->name == NULL) {
 		SPDK_ERRLOG("vsession alloc failed\n");
-		pthread_mutex_unlock(&g_vhost_mutex);
+		spdk_vhost_unlock();
 		free(vsession);
 		return -1;
 	}
@@ -1544,7 +1452,7 @@ vhost_new_connection_cb(int vid, const char *ifname)
 	TAILQ_INSERT_TAIL(&vdev->vsessions, vsession, tailq);
 
 	vhost_session_install_rte_compat_hooks(vsession);
-	pthread_mutex_unlock(&g_vhost_mutex);
+	spdk_vhost_unlock();
 	return 0;
 }
 
@@ -1554,18 +1462,18 @@ vhost_destroy_connection_cb(int vid)
 	struct spdk_vhost_session *vsession;
 	int rc = 0;
 
-	pthread_mutex_lock(&g_vhost_mutex);
+	spdk_vhost_lock();
 	vsession = vhost_session_find_by_vid(vid);
 	if (vsession == NULL) {
 		SPDK_ERRLOG("Couldn't find session with vid %d.\n", vid);
-		pthread_mutex_unlock(&g_vhost_mutex);
+		spdk_vhost_unlock();
 		return -EINVAL;
 	}
 
 	if (vsession->started) {
 		rc = _stop_session(vsession);
 		if (rc != 0) {
-			pthread_mutex_unlock(&g_vhost_mutex);
+			spdk_vhost_unlock();
 			return rc;
 		}
 	}
@@ -1573,7 +1481,7 @@ vhost_destroy_connection_cb(int vid)
 	TAILQ_REMOVE(&vsession->vdev->vsessions, vsession, tailq);
 	free(vsession->name);
 	free(vsession);
-	pthread_mutex_unlock(&g_vhost_mutex);
+	spdk_vhost_unlock();
 
 	return 0;
 }
@@ -1606,32 +1514,24 @@ spdk_vhost_init(spdk_vhost_init_cb init_cb)
 	g_vhost_init_thread = spdk_get_thread();
 	assert(g_vhost_init_thread != NULL);
 
-	if (dev_dirname[0] == '\0') {
-		if (getcwd(dev_dirname, sizeof(dev_dirname) - 1) == NULL) {
+	if (g_vhost_user_dev_dirname[0] == '\0') {
+		if (getcwd(g_vhost_user_dev_dirname, sizeof(g_vhost_user_dev_dirname) - 1) == NULL) {
 			SPDK_ERRLOG("getcwd failed (%d): %s\n", errno, spdk_strerror(errno));
-			ret = -1;
-			goto out;
+			init_cb(-1);
+			return;
 		}
 
-		len = strlen(dev_dirname);
-		if (dev_dirname[len - 1] != '/') {
-			dev_dirname[len] = '/';
-			dev_dirname[len + 1] = '\0';
+		len = strlen(g_vhost_user_dev_dirname);
+		if (g_vhost_user_dev_dirname[len - 1] != '/') {
+			g_vhost_user_dev_dirname[len] = '/';
+			g_vhost_user_dev_dirname[len + 1] = '\0';
 		}
-	}
-
-	ret = sem_init(&g_dpdk_sem, 0, 0);
-	if (ret != 0) {
-		SPDK_ERRLOG("Failed to initialize semaphore for rte_vhost pthread.\n");
-		ret = -1;
-		goto out;
 	}
 
 	spdk_cpuset_zero(&g_vhost_core_mask);
 	SPDK_ENV_FOREACH_CORE(i) {
 		spdk_cpuset_set_cpu(&g_vhost_core_mask, i, true);
 	}
-out:
 	init_cb(ret);
 }
 
@@ -1650,11 +1550,6 @@ vhost_fini(void *arg1)
 	}
 	spdk_vhost_unlock();
 
-	spdk_cpuset_zero(&g_vhost_core_mask);
-
-	/* All devices are removed now. */
-	sem_destroy(&g_dpdk_sem);
-
 	g_fini_cpl_cb();
 }
 
@@ -1664,14 +1559,15 @@ session_shutdown(void *arg)
 	struct spdk_vhost_dev *vdev = NULL;
 	struct spdk_vhost_session *vsession;
 
-	TAILQ_FOREACH(vdev, &g_vhost_devices, tailq) {
-		pthread_mutex_lock(&g_vhost_mutex);
+	for (vdev = spdk_vhost_dev_next(NULL); vdev != NULL;
+	     vdev = spdk_vhost_dev_next(vdev)) {
+		spdk_vhost_lock();
 		TAILQ_FOREACH(vsession, &vdev->vsessions, tailq) {
 			if (vsession->started) {
 				_stop_session(vsession);
 			}
 		}
-		pthread_mutex_unlock(&g_vhost_mutex);
+		spdk_vhost_unlock();
 		vhost_driver_unregister(vdev->path);
 		vdev->registered = false;
 	}
@@ -1712,8 +1608,8 @@ spdk_vhost_config_json(struct spdk_json_write_ctx *w)
 	spdk_json_write_array_begin(w);
 
 	spdk_vhost_lock();
-	vdev = spdk_vhost_dev_next(NULL);
-	while (vdev != NULL) {
+	for (vdev = spdk_vhost_dev_next(NULL); vdev != NULL;
+	     vdev = spdk_vhost_dev_next(vdev)) {
 		vdev->backend->write_config_json(vdev, w);
 
 		spdk_vhost_get_coalescing(vdev, &delay_base_us, &iops_threshold);
@@ -1729,7 +1625,6 @@ spdk_vhost_config_json(struct spdk_json_write_ctx *w)
 
 			spdk_json_write_object_end(w);
 		}
-		vdev = spdk_vhost_dev_next(vdev);
 	}
 	spdk_vhost_unlock();
 

@@ -714,7 +714,7 @@ class Initiator(Server):
     def set_local_nic_info_helper(self):
         return json.loads(self.exec_cmd(["lshw", "-json"]))
 
-    def __del__(self):
+    def stop(self):
         self.ssh_connection.close()
 
     def exec_cmd(self, cmd, stderr_redirect=False, change_dir=None):
@@ -954,7 +954,7 @@ class KernelTarget(Target):
         if "nvmet_bin" in target_config:
             self.nvmet_bin = target_config["nvmet_bin"]
 
-    def __del__(self):
+    def stop(self):
         nvmet_command(self.nvmet_bin, "clear")
 
     def kernel_tgt_gen_subsystem_conf(self, nvme_list, address_list):
@@ -968,6 +968,10 @@ class KernelTarget(Target):
         # Split disks between NIC IP's
         disks_per_ip = int(len(nvme_list) / len(address_list))
         disk_chunks = [nvme_list[i * disks_per_ip:disks_per_ip + disks_per_ip * i] for i in range(0, len(address_list))]
+
+        # Add remaining drives
+        for i, disk in enumerate(nvme_list[disks_per_ip * len(address_list):]):
+            disks_chunks[i].append(disk)
 
         subsys_no = 1
         port_no = 0
@@ -1050,6 +1054,7 @@ class SPDKTarget(Target):
         self.num_shared_buffers = 4096
         self.bpf_proc = None
         self.bpf_scripts = []
+        self.enable_idxd = False
 
         if "num_shared_buffers" in target_config:
             self.num_shared_buffers = target_config["num_shared_buffers"]
@@ -1059,6 +1064,11 @@ class SPDKTarget(Target):
             self.dif_insert_strip = target_config["dif_insert_strip"]
         if "bpf_scripts" in target_config:
             self.bpf_scripts = target_config["bpf_scripts"]
+        if "idxd_settings" in target_config:
+            self.enable_idxd = target_config["idxd_settings"]
+
+        self.log_print("====IDXD settings:====")
+        self.log_print("IDXD enabled: %s" % (self.enable_idxd))
 
     def get_num_cores(self, core_mask):
         if "0x" in core_mask:
@@ -1143,7 +1153,11 @@ class SPDKTarget(Target):
             disks_per_ip = 1
         else:
             disks_per_ip = int(len(num_disks) / len(ips))
-        disk_chunks = [num_disks[i * disks_per_ip:disks_per_ip + disks_per_ip * i] for i in range(0, len(ips))]
+        disk_chunks = [[*num_disks[i * disks_per_ip:disks_per_ip + disks_per_ip * i]] for i in range(0, len(ips))]
+
+        # Add remaining drives
+        for i, disk in enumerate(num_disks[disks_per_ip * len(ips):]):
+            disk_chunks[i].append(disk)
 
         # Create subsystems, add bdevs to namespaces, add listeners
         for ip, chunk in zip(ips, disk_chunks):
@@ -1211,8 +1225,11 @@ class SPDKTarget(Target):
             rpc.bdev.bdev_nvme_set_options(self.client, timeout_us=0, action_on_timeout=None,
                                            nvme_adminq_poll_period_us=100000, retry_count=4)
 
-        rpc.app.framework_set_scheduler(self.client, name=self.scheduler_name)
+        if self.enable_idxd:
+            rpc.idxd.idxd_scan_accel_engine(self.client, config_number=0, config_kernel_mode=None)
+            self.log_print("Target IDXD accel engine enabled")
 
+        rpc.app.framework_set_scheduler(self.client, name=self.scheduler_name)
         rpc.framework_start_init(self.client)
 
         if self.bpf_scripts:
@@ -1220,7 +1237,7 @@ class SPDKTarget(Target):
 
         self.spdk_tgt_configure()
 
-    def __del__(self):
+    def stop(self):
         if self.bpf_proc:
             self.log_print("Stopping BPF Trace script")
             self.bpf_proc.terminate()
@@ -1251,9 +1268,6 @@ class KernelInitiator(Initiator):
             self.ioengine = initiator_config["kernel_engine"]
             if "io_uring" in self.ioengine:
                 self.extra_params = "--nr-poll-queues=8"
-
-    def __del__(self):
-        self.ssh_connection.close()
 
     def get_connected_nvme_list(self):
         json_obj = json.loads(self.exec_cmd(["sudo", "nvme", "list", "-o", "json"]))
@@ -1335,6 +1349,11 @@ class SPDKInitiator(Initiator):
         # Required fields
         self.num_cores = initiator_config["num_cores"]
 
+        # Optional fields
+        self.enable_data_digest = False
+        if "enable_data_digest" in initiator_config:
+            self.enable_data_digest = initiator_config["enable_data_digest"]
+
     def install_spdk(self):
         self.log_print("Using fio binary %s" % self.fio_bin)
         self.exec_cmd(["git", "-C", self.spdk_dir, "submodule", "update", "--init"])
@@ -1372,6 +1391,9 @@ class SPDKInitiator(Initiator):
 
             if self.enable_adq:
                 nvme_ctrl["params"].update({"priority": "1"})
+
+            if self.enable_data_digest:
+                nvme_ctrl["params"].update({"ddgst": self.enable_data_digest})
 
             bdev_cfg_section["subsystems"][0]["config"].append(nvme_ctrl)
 
@@ -1466,77 +1488,87 @@ if __name__ == "__main__":
     except FileExistsError:
         pass
 
-    target_obj.tgt_start()
-
-    for i in initiators:
-        i.discover_subsystems(i.target_nic_ips, target_obj.subsys_no)
-        if i.enable_adq:
-            i.adq_configure_tc()
-
-    # Poor mans threading
-    # Run FIO tests
-    for block_size, io_depth, rw in fio_workloads:
-        threads = []
-        configs = []
-        for i in initiators:
-            if i.mode == "kernel":
-                i.kernel_init_connect()
-
-            cfg = i.gen_fio_config(rw, fio_rw_mix_read, block_size, io_depth, target_obj.subsys_no,
-                                   fio_num_jobs, fio_ramp_time, fio_run_time, fio_rate_iops)
-            configs.append(cfg)
-
-        for i, cfg in zip(initiators, configs):
-            t = threading.Thread(target=i.run_fio, args=(cfg, fio_run_num))
-            threads.append(t)
-        if target_obj.enable_sar:
-            sar_file_name = "_".join([str(block_size), str(rw), str(io_depth), "sar"])
-            sar_file_name = ".".join([sar_file_name, "txt"])
-            t = threading.Thread(target=target_obj.measure_sar, args=(args.results, sar_file_name))
-            threads.append(t)
-
-        if target_obj.enable_pcm:
-            pcm_fnames = ["%s_%s_%s_%s.csv" % (block_size, rw, io_depth, x) for x in ["pcm_cpu", "pcm_memory", "pcm_power"]]
-
-            pcm_cpu_t = threading.Thread(target=target_obj.measure_pcm, args=(args.results, pcm_fnames[0],))
-            pcm_mem_t = threading.Thread(target=target_obj.measure_pcm_memory, args=(args.results, pcm_fnames[1],))
-            pcm_pow_t = threading.Thread(target=target_obj.measure_pcm_power, args=(args.results, pcm_fnames[2],))
-
-            threads.append(pcm_cpu_t)
-            threads.append(pcm_mem_t)
-            threads.append(pcm_pow_t)
-
-        if target_obj.enable_bandwidth:
-            bandwidth_file_name = "_".join(["bandwidth", str(block_size), str(rw), str(io_depth)])
-            bandwidth_file_name = ".".join([bandwidth_file_name, "csv"])
-            t = threading.Thread(target=target_obj.measure_network_bandwidth, args=(args.results, bandwidth_file_name,))
-            threads.append(t)
-
-        if target_obj.enable_dpdk_memory:
-            t = threading.Thread(target=target_obj.measure_dpdk_memory, args=(args.results))
-            threads.append(t)
-
-        if target_obj.enable_adq:
-            ethtool_thread = threading.Thread(target=target_obj.ethtool_after_fio_ramp, args=(fio_ramp_time,))
-            threads.append(ethtool_thread)
-
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+    # TODO: This try block is definietly too large. Need to break this up into separate
+    # logical blocks to reduce size.
+    try:
+        target_obj.tgt_start()
 
         for i in initiators:
-            if i.mode == "kernel":
-                i.kernel_init_disconnect()
-            i.copy_result_files(args.results)
+            i.discover_subsystems(i.target_nic_ips, target_obj.subsys_no)
+            if i.enable_adq:
+                i.adq_configure_tc()
 
-    target_obj.restore_governor()
-    target_obj.restore_tuned()
-    target_obj.restore_services()
-    target_obj.restore_sysctl()
-    for i in initiators:
-        i.restore_governor()
-        i.restore_tuned()
-        i.restore_services()
-        i.restore_sysctl()
-    target_obj.parse_results(args.results, args.csv_filename)
+        # Poor mans threading
+        # Run FIO tests
+        for block_size, io_depth, rw in fio_workloads:
+            threads = []
+            configs = []
+            for i in initiators:
+                if i.mode == "kernel":
+                    i.kernel_init_connect()
+
+                cfg = i.gen_fio_config(rw, fio_rw_mix_read, block_size, io_depth, target_obj.subsys_no,
+                                       fio_num_jobs, fio_ramp_time, fio_run_time, fio_rate_iops)
+                configs.append(cfg)
+
+            for i, cfg in zip(initiators, configs):
+                t = threading.Thread(target=i.run_fio, args=(cfg, fio_run_num))
+                threads.append(t)
+            if target_obj.enable_sar:
+                sar_file_name = "_".join([str(block_size), str(rw), str(io_depth), "sar"])
+                sar_file_name = ".".join([sar_file_name, "txt"])
+                t = threading.Thread(target=target_obj.measure_sar, args=(args.results, sar_file_name))
+                threads.append(t)
+
+            if target_obj.enable_pcm:
+                pcm_fnames = ["%s_%s_%s_%s.csv" % (block_size, rw, io_depth, x) for x in ["pcm_cpu", "pcm_memory", "pcm_power"]]
+
+                pcm_cpu_t = threading.Thread(target=target_obj.measure_pcm, args=(args.results, pcm_fnames[0],))
+                pcm_mem_t = threading.Thread(target=target_obj.measure_pcm_memory, args=(args.results, pcm_fnames[1],))
+                pcm_pow_t = threading.Thread(target=target_obj.measure_pcm_power, args=(args.results, pcm_fnames[2],))
+
+                threads.append(pcm_cpu_t)
+                threads.append(pcm_mem_t)
+                threads.append(pcm_pow_t)
+
+            if target_obj.enable_bandwidth:
+                bandwidth_file_name = "_".join(["bandwidth", str(block_size), str(rw), str(io_depth)])
+                bandwidth_file_name = ".".join([bandwidth_file_name, "csv"])
+                t = threading.Thread(target=target_obj.measure_network_bandwidth, args=(args.results, bandwidth_file_name,))
+                threads.append(t)
+
+            if target_obj.enable_dpdk_memory:
+                t = threading.Thread(target=target_obj.measure_dpdk_memory, args=(args.results))
+                threads.append(t)
+
+            if target_obj.enable_adq:
+                ethtool_thread = threading.Thread(target=target_obj.ethtool_after_fio_ramp, args=(fio_ramp_time,))
+                threads.append(ethtool_thread)
+
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            for i in initiators:
+                if i.mode == "kernel":
+                    i.kernel_init_disconnect()
+                i.copy_result_files(args.results)
+
+        target_obj.restore_governor()
+        target_obj.restore_tuned()
+        target_obj.restore_services()
+        target_obj.restore_sysctl()
+        for i in initiators:
+            i.restore_governor()
+            i.restore_tuned()
+            i.restore_services()
+            i.restore_sysctl()
+        target_obj.parse_results(args.results, args.csv_filename)
+    finally:
+        for i in initiators:
+            try:
+                i.stop()
+            except Exception as err:
+                pass
+        target_obj.stop()

@@ -5,7 +5,7 @@
  *   All rights reserved.
  *
  *   Copyright (c) 2019-2021 Mellanox Technologies LTD. All rights reserved.
- *   Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *   Copyright (c) 2021, 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -991,7 +991,6 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 
 		if (spdk_nvme_ctrlr_connect_io_qpair(entry->u.nvme.ctrlr, qpair)) {
 			printf("ERROR: unable to connect I/O qpair.\n");
-			spdk_nvme_poll_group_remove(group, qpair);
 			spdk_nvme_ctrlr_free_io_qpair(qpair);
 			goto qpair_failed;
 		}
@@ -1001,7 +1000,6 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 
 qpair_failed:
 	for (; i > 0; --i) {
-		spdk_nvme_poll_group_remove(ns_ctx->u.nvme.group, ns_ctx->u.nvme.qpair[i - 1]);
 		spdk_nvme_ctrlr_free_io_qpair(ns_ctx->u.nvme.qpair[i - 1]);
 	}
 
@@ -1017,7 +1015,6 @@ nvme_cleanup_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 	int i;
 
 	for (i = 0; i < ns_ctx->u.nvme.num_all_qpairs; i++) {
-		spdk_nvme_poll_group_remove(ns_ctx->u.nvme.group, ns_ctx->u.nvme.qpair[i]);
 		spdk_nvme_ctrlr_free_io_qpair(ns_ctx->u.nvme.qpair[i]);
 	}
 
@@ -1662,8 +1659,9 @@ work_fn(void *arg)
 
 		if (tsc_current > tsc_end) {
 			if (warmup) {
-				/* Update test end time, clear statistics */
-				tsc_end = tsc_current + g_time_in_sec * g_tsc_rate;
+				/* Update test start and end time, clear statistics */
+				tsc_start = spdk_get_ticks();
+				tsc_end = tsc_start + g_time_in_sec * g_tsc_rate;
 
 				TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 					memset(&ns_ctx->stats, 0, sizeof(ns_ctx->stats));
@@ -2860,12 +2858,13 @@ int main(int argc, char **argv)
 	rc = pthread_mutex_init(&g_stats_mutex, NULL);
 	if (rc != 0) {
 		fprintf(stderr, "Failed to init mutex\n");
-		goto cleanup;
+		return -1;
 	}
 	if (spdk_env_init(&opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
-		rc = -1;
-		goto cleanup;
+		unregister_trids();
+		pthread_mutex_destroy(&g_stats_mutex);
+		return -1;
 	}
 
 	rc = setup_sig_handlers();
@@ -2955,6 +2954,8 @@ cleanup:
 	unregister_namespaces();
 	unregister_controllers();
 	unregister_workers();
+
+	spdk_env_fini();
 
 	pthread_mutex_destroy(&g_stats_mutex);
 

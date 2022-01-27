@@ -63,12 +63,14 @@ if ! check_ip_is_soft_roce $NVMF_FIRST_TARGET_IP; then
 fi
 
 run_test "nvmf_multipath" test/nvmf/target/multipath.sh "${TEST_ARGS[@]}"
+run_test "nvmf_zcopy" test/nvmf/target/zcopy.sh "${TEST_ARGS[@]}"
 
 timing_enter host
 
 run_test "nvmf_identify" test/nvmf/host/identify.sh "${TEST_ARGS[@]}"
 run_test "nvmf_perf" test/nvmf/host/perf.sh "${TEST_ARGS[@]}"
-run_test "nvmf_multipath" test/nvmf/host/multipath.sh "${TEST_ARGS[@]}"
+run_test "nvmf_failover" test/nvmf/host/failover.sh "${TEST_ARGS[@]}"
+run_test "nvmf_discovery" test/nvmf/host/discovery.sh "${TEST_ARGS[@]}"
 
 # TODO: disabled due to intermittent failures (RDMA_CM_EVENT_UNREACHABLE/ETIMEDOUT)
 #run_test test/nvmf/host/identify_kernel_nvmf.sh $TEST_ARGS

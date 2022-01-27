@@ -53,6 +53,10 @@
 #define KAS_TIME_UNIT_IN_MS 100
 #define KAS_DEFAULT_VALUE (MIN_KEEP_ALIVE_TIMEOUT_IN_MS / KAS_TIME_UNIT_IN_MS)
 
+#define NVMF_CC_RESET_SHN_TIMEOUT_IN_MS	10000
+
+#define NVMF_CTRLR_RESET_SHN_TIMEOUT_IN_MS	(NVMF_CC_RESET_SHN_TIMEOUT_IN_MS + 5000)
+
 /*
  * Report the SPDK version as the firmware revision.
  * SPDK_VERSION_STRING won't fit into FR (only 8 bytes), so try to fit the most important parts.
@@ -350,6 +354,9 @@ nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 		ctrlr->cntlid = connect_data->cntlid;
 	}
 
+	SPDK_DTRACE_PROBE3(nvmf_ctrlr_create, ctrlr, subsystem->subnqn,
+			   spdk_thread_get_id(req->qpair->group->thread));
+
 	STAILQ_INIT(&ctrlr->async_events);
 	TAILQ_INIT(&ctrlr->log_head);
 	ctrlr->subsys = subsystem;
@@ -428,7 +435,8 @@ nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 	ctrlr->vcprop.cap.bits.mqes = transport->opts.max_queue_depth -
 				      1; /* max queue depth */
 	ctrlr->vcprop.cap.bits.ams = 0; /* optional arb mechanisms */
-	ctrlr->vcprop.cap.bits.to = 1; /* ready timeout - 500 msec units */
+	/* ready timeout - 500 msec units */
+	ctrlr->vcprop.cap.bits.to = NVMF_CTRLR_RESET_SHN_TIMEOUT_IN_MS / 500;
 	ctrlr->vcprop.cap.bits.dstrd = 0; /* fixed to 0 for NVMe-oF */
 	ctrlr->vcprop.cap.bits.css = SPDK_NVME_CAP_CSS_NVM; /* NVM command set */
 	ctrlr->vcprop.cap.bits.mpsmin = 0; /* 2 ^ (12 + mpsmin) == 4k */
@@ -483,9 +491,13 @@ _nvmf_ctrlr_destruct(void *ctx)
 	struct spdk_nvmf_reservation_log *log, *log_tmp;
 	struct spdk_nvmf_async_event_completion *event, *event_tmp;
 
+	SPDK_DTRACE_PROBE3(nvmf_ctrlr_destruct, ctrlr, ctrlr->subsys->subnqn,
+			   spdk_thread_get_id(ctrlr->thread));
+
 	assert(spdk_get_thread() == ctrlr->thread);
 	assert(ctrlr->in_destruct);
 
+	SPDK_DEBUGLOG(nvmf, "Destroy ctrlr 0x%hx\n", ctrlr->cntlid);
 	if (ctrlr->disconnect_in_progress) {
 		SPDK_ERRLOG("freeing ctrlr with disconnect in progress\n");
 		spdk_thread_send_msg(ctrlr->thread, _nvmf_ctrlr_destruct, ctrlr);
@@ -523,6 +535,9 @@ nvmf_ctrlr_add_io_qpair(void *ctx)
 	struct spdk_nvmf_qpair *qpair = req->qpair;
 	struct spdk_nvmf_ctrlr *ctrlr = qpair->ctrlr;
 	struct spdk_nvmf_qpair *admin_qpair = ctrlr->admin_qpair;
+
+	SPDK_DTRACE_PROBE4(nvmf_ctrlr_add_io_qpair, ctrlr, req->qpair, req->qpair->qid,
+			   spdk_thread_get_id(ctrlr->thread));
 
 	/* Unit test will check qpair->ctrlr after calling spdk_nvmf_ctrlr_connect.
 	  * For error case, the value should be NULL. So set it to NULL at first.
@@ -924,10 +939,12 @@ nvmf_ctrlr_association_remove(void *ctx)
 	SPDK_DEBUGLOG(nvmf, "Disconnecting host from subsystem %s due to association timeout.\n",
 		      ctrlr->subsys->subnqn);
 
-	rc = spdk_nvmf_qpair_disconnect(ctrlr->admin_qpair, NULL, NULL);
-	if (rc < 0) {
-		SPDK_ERRLOG("Fail to disconnect admin ctrlr qpair\n");
-		assert(false);
+	if (ctrlr->admin_qpair) {
+		rc = spdk_nvmf_qpair_disconnect(ctrlr->admin_qpair, NULL, NULL);
+		if (rc < 0) {
+			SPDK_ERRLOG("Fail to disconnect admin ctrlr qpair\n");
+			assert(false);
+		}
 	}
 
 	return SPDK_POLLER_BUSY;
@@ -937,6 +954,7 @@ static int
 _nvmf_ctrlr_cc_reset_shn_done(void *ctx)
 {
 	struct spdk_nvmf_ctrlr *ctrlr = ctx;
+	uint64_t now = spdk_get_ticks();
 	uint32_t count;
 
 	if (ctrlr->cc_timer) {
@@ -947,9 +965,18 @@ _nvmf_ctrlr_cc_reset_shn_done(void *ctx)
 	SPDK_DEBUGLOG(nvmf, "ctrlr %p active queue count %u\n", ctrlr, count);
 
 	if (count > 1) {
-		ctrlr->cc_timer = SPDK_POLLER_REGISTER(_nvmf_ctrlr_cc_reset_shn_done, ctrlr, 100 * 1000);
-		return SPDK_POLLER_IDLE;
+		if (now < ctrlr->cc_timeout_tsc) {
+			/* restart cc timer */
+			ctrlr->cc_timer = SPDK_POLLER_REGISTER(_nvmf_ctrlr_cc_reset_shn_done, ctrlr, 100 * 1000);
+			return SPDK_POLLER_IDLE;
+		} else {
+			/* controller fatal status */
+			SPDK_WARNLOG("IO timeout, ctrlr %p is in fatal status\n", ctrlr);
+			ctrlr->vcprop.csts.bits.cfs = 1;
+		}
 	}
+
+	spdk_poller_unregister(&ctrlr->cc_timeout_timer);
 
 	if (ctrlr->disconnect_is_shn) {
 		ctrlr->vcprop.csts.bits.shst = SPDK_NVME_SHST_COMPLETE;
@@ -987,6 +1014,40 @@ nvmf_ctrlr_cc_reset_shn_done(struct spdk_io_channel_iter *i, int status)
 	_nvmf_ctrlr_cc_reset_shn_done((void *)ctrlr);
 }
 
+static void
+nvmf_bdev_complete_reset(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	SPDK_NOTICELOG("Resetting bdev done with %s\n", success ? "success" : "failure");
+
+	spdk_bdev_free_io(bdev_io);
+}
+
+
+static int
+nvmf_ctrlr_cc_timeout(void *ctx)
+{
+	struct spdk_nvmf_ctrlr *ctrlr = ctx;
+	struct spdk_nvmf_poll_group *group = ctrlr->admin_qpair->group;
+	struct spdk_nvmf_ns *ns;
+	struct spdk_nvmf_subsystem_pg_ns_info *ns_info;
+
+	assert(group != NULL && group->sgroups != NULL);
+	spdk_poller_unregister(&ctrlr->cc_timeout_timer);
+	SPDK_DEBUGLOG(nvmf, "Ctrlr %p reset or shutdown timeout\n", ctrlr);
+
+	for (ns = spdk_nvmf_subsystem_get_first_ns(ctrlr->subsys); ns != NULL;
+	     ns = spdk_nvmf_subsystem_get_next_ns(ctrlr->subsys, ns)) {
+		if (ns->bdev == NULL) {
+			continue;
+		}
+		ns_info = &group->sgroups[ctrlr->subsys->id].ns_info[ns->opts.nsid - 1];
+		SPDK_NOTICELOG("Ctrlr %p resetting NSID %u\n", ctrlr, ns->opts.nsid);
+		spdk_bdev_reset(ns->desc, ns_info->channel, nvmf_bdev_complete_reset, NULL);
+	}
+
+	return SPDK_POLLER_BUSY;
+}
+
 const struct spdk_nvmf_registers *
 spdk_nvmf_ctrlr_get_regs(struct spdk_nvmf_ctrlr *ctrlr)
 {
@@ -1015,6 +1076,7 @@ static bool
 nvmf_prop_set_cc(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value)
 {
 	union spdk_nvme_cc_register cc, diff;
+	uint32_t cc_timeout_ms;
 
 	cc.raw = value;
 
@@ -1041,6 +1103,12 @@ nvmf_prop_set_cc(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value)
 				return true;
 			}
 
+			ctrlr->cc_timeout_timer = SPDK_POLLER_REGISTER(nvmf_ctrlr_cc_timeout, ctrlr,
+						  NVMF_CC_RESET_SHN_TIMEOUT_IN_MS * 1000);
+			/* Make sure cc_timeout_ms is between cc_timeout_timer and Host reset/shutdown timeout */
+			cc_timeout_ms = (NVMF_CC_RESET_SHN_TIMEOUT_IN_MS + NVMF_CTRLR_RESET_SHN_TIMEOUT_IN_MS) / 2;
+			ctrlr->cc_timeout_tsc = spdk_get_ticks() + cc_timeout_ms * spdk_get_ticks_hz() / (uint64_t)1000;
+
 			ctrlr->vcprop.cc.bits.en = 0;
 			ctrlr->disconnect_in_progress = true;
 			ctrlr->disconnect_is_shn = false;
@@ -1061,6 +1129,12 @@ nvmf_prop_set_cc(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value)
 				SPDK_DEBUGLOG(nvmf, "Disconnect in progress\n");
 				return true;
 			}
+
+			ctrlr->cc_timeout_timer = SPDK_POLLER_REGISTER(nvmf_ctrlr_cc_timeout, ctrlr,
+						  NVMF_CC_RESET_SHN_TIMEOUT_IN_MS * 1000);
+			/* Make sure cc_timeout_ms is between cc_timeout_timer and Host reset/shutdown timeout */
+			cc_timeout_ms = (NVMF_CC_RESET_SHN_TIMEOUT_IN_MS + NVMF_CTRLR_RESET_SHN_TIMEOUT_IN_MS) / 2;
+			ctrlr->cc_timeout_tsc = spdk_get_ticks() + cc_timeout_ms * spdk_get_ticks_hz() / (uint64_t)1000;
 
 			ctrlr->vcprop.cc.bits.shn = cc.bits.shn;
 			ctrlr->disconnect_in_progress = true;
@@ -1829,6 +1903,70 @@ nvmf_ctrlr_set_features_number_of_queues(struct spdk_nvmf_request *req)
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
+int
+nvmf_ctrlr_save_aers(struct spdk_nvmf_ctrlr *ctrlr, uint16_t *aer_cids,
+		     uint16_t max_aers)
+{
+	struct spdk_nvmf_request *req;
+	uint16_t i;
+
+	if (!aer_cids || max_aers < ctrlr->nr_aer_reqs) {
+		return -EINVAL;
+	}
+
+	for (i = 0; i < ctrlr->nr_aer_reqs; i++) {
+		req = ctrlr->aer_req[i];
+		aer_cids[i] = req->cmd->nvme_cmd.cid;
+	}
+
+	return ctrlr->nr_aer_reqs;
+}
+
+int
+nvmf_ctrlr_save_migr_data(struct spdk_nvmf_ctrlr *ctrlr, struct nvmf_ctrlr_migr_data *data)
+{
+	uint32_t num_async_events = 0;
+	struct spdk_nvmf_async_event_completion *event, *event_tmp;
+
+	memcpy(&data->feat, &ctrlr->feat, sizeof(struct spdk_nvmf_ctrlr_feat));
+	data->cntlid = ctrlr->cntlid;
+	data->acre_enabled = ctrlr->acre_enabled;
+	data->notice_aen_mask = ctrlr->notice_aen_mask;
+
+	STAILQ_FOREACH_SAFE(event, &ctrlr->async_events, link, event_tmp) {
+		data->async_events[num_async_events++].raw = event->event.raw;
+		if (num_async_events == NVMF_MIGR_MAX_PENDING_AERS) {
+			SPDK_ERRLOG("%p has too many pending AERs\n", ctrlr);
+			break;
+		}
+	}
+	data->num_async_events = num_async_events;
+
+	return 0;
+}
+
+int
+nvmf_ctrlr_restore_migr_data(struct spdk_nvmf_ctrlr *ctrlr, struct nvmf_ctrlr_migr_data *data)
+{
+	struct spdk_nvmf_async_event_completion *event;
+	uint32_t i;
+
+	memcpy(&ctrlr->feat, &data->feat, sizeof(struct spdk_nvmf_ctrlr_feat));
+	ctrlr->acre_enabled = data->acre_enabled;
+	ctrlr->notice_aen_mask = data->notice_aen_mask;
+
+	for (i = 0; i < data->num_async_events; i++) {
+		event = calloc(1, sizeof(struct spdk_nvmf_async_event_completion));
+		if (!event) {
+			return -ENOMEM;
+		}
+		event->event.raw = data->async_events[i].raw;
+		STAILQ_INSERT_TAIL(&ctrlr->async_events, event, link);
+	}
+
+	return 0;
+}
+
 static int
 nvmf_ctrlr_set_features_async_event_configuration(struct spdk_nvmf_request *req)
 {
@@ -2430,6 +2568,7 @@ spdk_nvmf_ctrlr_identify_ns(struct spdk_nvmf_ctrlr *ctrlr,
 
 	nvmf_bdev_ctrlr_identify_ns(ns, nsdata, ctrlr->dif_insert_or_strip);
 
+	assert(ctrlr->admin_qpair);
 	/* Due to bug in the Linux kernel NVMe driver we have to set noiob no larger than mdts */
 	max_num_blocks = ctrlr->admin_qpair->transport->opts.max_io_size /
 			 (1U << nsdata->lbaf[nsdata->flbas.format].lbads);
@@ -2485,11 +2624,13 @@ int
 spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr, struct spdk_nvme_ctrlr_data *cdata)
 {
 	struct spdk_nvmf_subsystem *subsystem = ctrlr->subsys;
-	struct spdk_nvmf_transport *transport = ctrlr->admin_qpair->transport;
+	struct spdk_nvmf_transport *transport;
 
 	/*
 	 * Common fields for discovery and NVM subsystems
 	 */
+	assert(ctrlr->admin_qpair);
+	transport = ctrlr->admin_qpair->transport;
 	spdk_strcpy_pad(cdata->fr, FW_VERSION, sizeof(cdata->fr), ' ');
 	assert((transport->opts.max_io_size % 4096) == 0);
 	cdata->mdts = spdk_u32log2(transport->opts.max_io_size / 4096);
@@ -2775,6 +2916,26 @@ nvmf_qpair_abort_aer(struct spdk_nvmf_qpair *qpair, uint16_t cid)
 	}
 
 	return false;
+}
+
+void
+nvmf_qpair_abort_pending_zcopy_reqs(struct spdk_nvmf_qpair *qpair)
+{
+	struct spdk_nvmf_request *req, *tmp;
+
+	TAILQ_FOREACH_SAFE(req, &qpair->outstanding, link, tmp) {
+		if (req->zcopy_phase == NVMF_ZCOPY_PHASE_EXECUTE) {
+			/* Zero-copy requests are kept on the outstanding queue from the moment
+			 * zcopy_start is sent until a zcopy_end callback is received.  Therefore,
+			 * we can't remove them from the outstanding queue here, but need to rely on
+			 * the transport to do a zcopy_end to release their buffers and, in turn,
+			 * remove them from the queue.
+			 */
+			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_ABORTED_BY_REQUEST;
+			nvmf_transport_req_free(req);
+		}
+	}
 }
 
 static void
@@ -3689,7 +3850,7 @@ nvmf_ctrlr_use_zcopy(struct spdk_nvmf_request *req)
 	struct spdk_nvmf_transport *transport = req->qpair->transport;
 	struct spdk_nvmf_ns *ns;
 
-	req->zcopy_phase = NVMF_ZCOPY_PHASE_NONE;
+	assert(req->zcopy_phase == NVMF_ZCOPY_PHASE_NONE);
 
 	if (!transport->opts.zcopy) {
 		return false;

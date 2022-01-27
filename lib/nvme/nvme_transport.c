@@ -4,7 +4,7 @@
  *   Copyright (c) Intel Corporation.
  *   All rights reserved.
  *   Copyright (c) 2021 Mellanox Technologies LTD. All rights reserved.
- *   Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *   Copyright (c) 2021, 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -684,23 +684,23 @@ int
 nvme_transport_poll_group_remove(struct spdk_nvme_transport_poll_group *tgroup,
 				 struct spdk_nvme_qpair *qpair)
 {
-	int rc;
+	int rc __attribute__((unused));
 
-	rc = tgroup->transport->ops.poll_group_remove(tgroup, qpair);
-	if (rc == 0) {
-		if (qpair->poll_group_tailq_head == &tgroup->connected_qpairs) {
-			STAILQ_REMOVE(&tgroup->connected_qpairs, qpair, spdk_nvme_qpair, poll_group_stailq);
-		} else if (qpair->poll_group_tailq_head == &tgroup->disconnected_qpairs) {
-			STAILQ_REMOVE(&tgroup->disconnected_qpairs, qpair, spdk_nvme_qpair, poll_group_stailq);
-		} else {
-			return -ENOENT;
-		}
-
-		qpair->poll_group = NULL;
-		qpair->poll_group_tailq_head = NULL;
+	if (qpair->poll_group_tailq_head == &tgroup->connected_qpairs) {
+		return -EINVAL;
+	} else if (qpair->poll_group_tailq_head != &tgroup->disconnected_qpairs) {
+		return -ENOENT;
 	}
 
-	return rc;
+	rc = tgroup->transport->ops.poll_group_remove(tgroup, qpair);
+	assert(rc == 0);
+
+	STAILQ_REMOVE(&tgroup->disconnected_qpairs, qpair, spdk_nvme_qpair, poll_group_stailq);
+
+	qpair->poll_group = NULL;
+	qpair->poll_group_tailq_head = NULL;
+
+	return 0;
 }
 
 int64_t
@@ -752,7 +752,7 @@ int
 nvme_transport_poll_group_disconnect_qpair(struct spdk_nvme_qpair *qpair)
 {
 	struct spdk_nvme_transport_poll_group *tgroup;
-	int rc;
+	int rc __attribute__((unused));
 
 	tgroup = qpair->poll_group;
 
@@ -762,16 +762,13 @@ nvme_transport_poll_group_disconnect_qpair(struct spdk_nvme_qpair *qpair)
 
 	if (qpair->poll_group_tailq_head == &tgroup->connected_qpairs) {
 		rc = tgroup->transport->ops.poll_group_disconnect_qpair(qpair);
-		if (rc == 0) {
-			qpair->poll_group_tailq_head = &tgroup->disconnected_qpairs;
-			STAILQ_REMOVE(&tgroup->connected_qpairs, qpair, spdk_nvme_qpair, poll_group_stailq);
-			STAILQ_INSERT_TAIL(&tgroup->disconnected_qpairs, qpair, poll_group_stailq);
-			/* EINPROGRESS indicates that a call has already been made to this function.
-			 * It just keeps us from segfaulting on a double removal/insert.
-			 */
-		}
+		assert(rc == 0);
 
-		return rc == -EINPROGRESS ? 0 : rc;
+		qpair->poll_group_tailq_head = &tgroup->disconnected_qpairs;
+		STAILQ_REMOVE(&tgroup->connected_qpairs, qpair, spdk_nvme_qpair, poll_group_stailq);
+		STAILQ_INSERT_TAIL(&tgroup->disconnected_qpairs, qpair, poll_group_stailq);
+
+		return 0;
 	}
 
 	return -EINVAL;

@@ -54,6 +54,7 @@
 #include "spdk/memory.h"
 #include "spdk/nvme_intel.h"
 #include "spdk/nvmf_spec.h"
+#include "spdk/tree.h"
 #include "spdk/uuid.h"
 
 #include "spdk_internal/assert.h"
@@ -517,6 +518,7 @@ struct spdk_nvme_ns {
 	uint32_t			sectors_per_stripe;
 	uint32_t			id;
 	uint16_t			flags;
+	bool				active;
 
 	/* Command Set Identifier */
 	enum spdk_nvme_csi		csi;
@@ -532,6 +534,8 @@ struct spdk_nvme_ns {
 
 	/* Zoned Namespace Command Set Specific Identify Namespace data. */
 	struct spdk_nvme_zns_ns_data	*nsdata_zns;
+
+	RB_ENTRY(spdk_nvme_ns)		node;
 };
 
 /**
@@ -857,10 +861,11 @@ struct nvme_register_completion {
 struct spdk_nvme_ctrlr {
 	/* Hot data (accessed in I/O path) starts here. */
 
-	/** Array of namespaces indexed by nsid - 1 */
-	struct spdk_nvme_ns		*ns;
+	/* Tree of namespaces */
+	RB_HEAD(nvme_ns_tree, spdk_nvme_ns)	ns;
 
-	uint32_t			num_ns;
+	/* The number of active namespaces */
+	uint32_t			active_ns_count;
 
 	bool				is_removed;
 
@@ -943,12 +948,6 @@ struct spdk_nvme_ctrlr {
 	 * Zoned Namespace Command Set Specific Identify Controller data.
 	 */
 	struct spdk_nvme_zns_ctrlr_data	*cdata_zns;
-
-	/**
-	 * Keep track of active namespaces
-	 */
-	uint32_t			active_ns_count;
-	uint32_t			*active_ns_list;
 
 	struct spdk_bit_array		*free_io_qids;
 	TAILQ_HEAD(, spdk_nvme_qpair)	active_io_qpairs;

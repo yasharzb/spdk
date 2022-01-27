@@ -239,7 +239,7 @@ if __name__ == "__main__":
                                        pmd=args.pmd)
     p = subparsers.add_parser('bdev_compress_set_pmd', aliases=['set_compress_pmd', 'compress_set_pmd'],
                               help='Set pmd option for a compress disk')
-    p.add_argument('-p', '--pmd', type=int, help='0 = auto-select, 1= QAT only, 2 = ISAL only')
+    p.add_argument('-p', '--pmd', type=int, help='0 = auto-select, 1= QAT only, 2 = ISAL only, 3 = mlx5_pci only')
     p.set_defaults(func=bdev_compress_set_pmd)
 
     def bdev_compress_get_orphans(args):
@@ -426,6 +426,14 @@ if __name__ == "__main__":
     p.add_argument('block_size', help='Block size for this bdev', type=int, nargs='?', default=0)
     p.set_defaults(func=bdev_aio_create)
 
+    def bdev_aio_rescan(args):
+        print_json(rpc.bdev.bdev_aio_rescan(args.client,
+                                            name=args.name))
+
+    p = subparsers.add_parser('bdev_aio_rescan', help='Rescan a bdev size with aio backend')
+    p.add_argument('name', help='Block device name')
+    p.set_defaults(func=bdev_aio_rescan)
+
     def bdev_aio_delete(args):
         rpc.bdev.bdev_aio_delete(args.client,
                                  name=args.name)
@@ -538,7 +546,10 @@ if __name__ == "__main__":
                                                          ddgst=args.ddgst,
                                                          fabrics_timeout=args.fabrics_timeout,
                                                          multipath=args.multipath,
-                                                         num_io_queues=args.num_io_queues))
+                                                         num_io_queues=args.num_io_queues,
+                                                         ctrlr_loss_timeout_sec=args.ctrlr_loss_timeout_sec,
+                                                         reconnect_delay_sec=args.reconnect_delay_sec,
+                                                         fast_io_fail_timeout_sec=args.fast_io_fail_timeout_sec))
 
     p = subparsers.add_parser('bdev_nvme_attach_controller', aliases=['construct_nvme_bdev'],
                               help='Add bdevs with nvme backend')
@@ -570,6 +581,26 @@ if __name__ == "__main__":
     p.add_argument('--fabrics-timeout', type=int, help='Fabrics connect timeout in microseconds')
     p.add_argument('-x', '--multipath', help='Set multipath behavior (disable, failover, multipath)')
     p.add_argument('--num-io-queues', type=int, help='Set the number of IO queues to request during initialization.')
+    p.add_argument('-l', '--ctrlr-loss-timeout-sec',
+                   help="""Time to wait until ctrlr is reconnected before deleting ctrlr.
+                   -1 means infinite reconnect retries. 0 means no reconnect retry.
+                   If reconnect_delay_sec is zero, ctrlr_loss_timeout_sec has to be zero.
+                   If reconnect_delay_sec is non-zero, ctrlr_loss_timeout_sec has to be -1 or not less than
+                   reconnect_delay_sec.""",
+                   type=int)
+    p.add_argument('-o', '--reconnect-delay-sec',
+                   help="""Time to delay a reconnect retry.
+                   If ctrlr_loss_timeout_sec is zero, reconnect_delay_sec has to be zero.
+                   If ctrlr_loss_timeout_sec is -1, reconnect_delay_sec has to be non-zero.
+                   If ctrlr_loss_timeout_sec is not -1 or zero, reconnect_delay_sec has to be non-zero and
+                   less than ctrlr_loss_timeout_sec.""",
+                   type=int)
+    p.add_argument('-u', '--fast-io-fail-timeout-sec',
+                   help="""Time to wait until ctrlr is reconnected before failing I/O to ctrlr.
+                   0 means no such timeout.
+                   If fast_io_fail_timeout_sec is not zero, it has to be not less than reconnect_delay_sec and
+                   less than ctrlr_loss_timeout_sec if ctrlr_loss_timeout_sec is not -1.""",
+                   type=int)
     p.set_defaults(func=bdev_nvme_attach_controller)
 
     def bdev_nvme_get_controllers(args):
@@ -618,6 +649,35 @@ if __name__ == "__main__":
                               help='Reset an NVMe controller')
     p.add_argument('name', help="Name of the NVMe controller")
     p.set_defaults(func=bdev_nvme_reset_controller)
+
+    def bdev_nvme_start_discovery(args):
+        rpc.bdev.bdev_nvme_start_discovery(args.client,
+                                           name=args.name,
+                                           trtype=args.trtype,
+                                           traddr=args.traddr,
+                                           adrfam=args.adrfam,
+                                           trsvcid=args.trsvcid,
+                                           hostnqn=args.hostnqn)
+
+    p = subparsers.add_parser('bdev_nvme_start_discovery', help='Start automatic discovery')
+    p.add_argument('-b', '--name', help="Name of the NVMe controller prefix for each bdev name", required=True)
+    p.add_argument('-t', '--trtype',
+                   help='NVMe-oF target trtype: e.g., rdma, pcie', required=True)
+    p.add_argument('-a', '--traddr',
+                   help='NVMe-oF target address: e.g., an ip address or BDF', required=True)
+    p.add_argument('-f', '--adrfam',
+                   help='NVMe-oF target adrfam: e.g., ipv4, ipv6, ib, fc, intra_host')
+    p.add_argument('-s', '--trsvcid',
+                   help='NVMe-oF target trsvcid: e.g., a port number')
+    p.add_argument('-q', '--hostnqn', help='NVMe-oF host subnqn')
+    p.set_defaults(func=bdev_nvme_start_discovery)
+
+    def bdev_nvme_stop_discovery(args):
+        rpc.bdev.bdev_nvme_stop_discovery(args.client, name=args.name)
+
+    p = subparsers.add_parser('bdev_nvme_stop_discovery', help='Stop automatic discovery')
+    p.add_argument('-b', '--name', help="Name of the service to stop", required=True)
+    p.set_defaults(func=bdev_nvme_stop_discovery)
 
     def bdev_nvme_cuse_register(args):
         rpc.bdev.bdev_nvme_cuse_register(args.client,
@@ -675,7 +735,8 @@ if __name__ == "__main__":
                                                       name=args.name,
                                                       user=args.user,
                                                       config_param=config_param,
-                                                      config_file=args.config_file))
+                                                      config_file=args.config_file,
+                                                      key_file=args.key_file))
 
     p = subparsers.add_parser('bdev_rbd_register_cluster',
                               help='Add a Rados cluster with ceph rbd backend')
@@ -684,6 +745,7 @@ if __name__ == "__main__":
     p.add_argument('--config-param', action='append', metavar='key=value',
                    help="adds a key=value configuration option for rados_conf_set (default: rely on config file)")
     p.add_argument('--config-file', help="The file path of the Rados configuration file", required=False)
+    p.add_argument('--key-file', help="The file path of the Rados keyring file", required=False)
     p.set_defaults(func=bdev_rbd_register_cluster)
 
     def bdev_rbd_unregister_cluster(args):
@@ -1533,6 +1595,34 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
         'name', help="""trace group name we want to disable in tpoint_group_mask.
         (for example "bdev" for bdev trace group, "all" for all trace groups).""")
     p.set_defaults(func=trace_disable_tpoint_group)
+
+    def trace_set_tpoint_mask(args):
+        rpc.trace.trace_set_tpoint_mask(args.client, name=args.name, tpoint_mask=args.tpoint_mask)
+
+    p = subparsers.add_parser('trace_set_tpoint_mask',
+                              help='enable tracepoint mask on a specific tpoint group')
+    p.add_argument(
+        'name', help="""trace group name we want to enable in tpoint_group_mask.
+        (for example "bdev" for bdev trace group)""")
+    p.add_argument(
+        'tpoint_mask', help="""tracepoints to be enabled inside a given trace group.
+        (for example value of "0x3" will enable only the first two tpoints in this group)""",
+        type=lambda m: int(m, 16))
+    p.set_defaults(func=trace_set_tpoint_mask)
+
+    def trace_clear_tpoint_mask(args):
+        rpc.trace.trace_clear_tpoint_mask(args.client, name=args.name, tpoint_mask=args.tpoint_mask)
+
+    p = subparsers.add_parser('trace_clear_tpoint_mask',
+                              help='disable tracepoint mask on a specific tpoint group')
+    p.add_argument(
+        'name', help="""trace group name we want to disable in tpoint_group_mask.
+        (for example "bdev" for bdev trace group)""")
+    p.add_argument(
+        'tpoint_mask', help="""tracepoints to be disabled inside a given trace group.
+        (for example value of "0x3" will disable the first two tpoints in this group)""",
+        type=lambda m: int(m, 16))
+    p.set_defaults(func=trace_clear_tpoint_mask)
 
     def trace_get_tpoint_group_mask(args):
         print_dict(rpc.trace.trace_get_tpoint_group_mask(args.client))

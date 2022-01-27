@@ -43,6 +43,7 @@ DEFINE_STUB_V(nvmf_transport_qpair_fini, (struct spdk_nvmf_qpair *qpair,
 		spdk_nvmf_transport_qpair_fini_cb cb_fn,
 		void *cb_arg));
 DEFINE_STUB_V(nvmf_qpair_free_aer, (struct spdk_nvmf_qpair *qpair));
+DEFINE_STUB_V(nvmf_qpair_abort_pending_zcopy_reqs, (struct spdk_nvmf_qpair *qpair));
 DEFINE_STUB(nvmf_transport_poll_group_create, struct spdk_nvmf_transport_poll_group *,
 	    (struct spdk_nvmf_transport *transport), NULL);
 DEFINE_STUB(spdk_bdev_get_io_channel, struct spdk_io_channel *, (struct spdk_bdev_desc *desc),
@@ -121,6 +122,7 @@ DEFINE_STUB(nvmf_transport_qpair_get_listen_trid, int,
 	    (struct spdk_nvmf_qpair *qpair,
 	     struct spdk_nvme_transport_id *trid), 0);
 DEFINE_STUB_V(spdk_nvmf_request_exec, (struct spdk_nvmf_request *req));
+DEFINE_STUB_V(spdk_nvmf_request_zcopy_start, (struct spdk_nvmf_request *req));
 DEFINE_STUB(spdk_nvmf_get_transport_name, const char *,
 	    (struct spdk_nvmf_transport *transport), NULL);
 DEFINE_STUB(spdk_nvmf_transport_destroy, int, (struct spdk_nvmf_transport *transport,
