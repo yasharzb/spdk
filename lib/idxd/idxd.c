@@ -249,7 +249,8 @@ err_chan:
 	return NULL;
 }
 
-static int idxd_batch_cancel(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch);
+static int idxd_batch_cancel(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
+			     int status);
 
 void
 spdk_idxd_put_channel(struct spdk_idxd_io_channel *chan)
@@ -259,8 +260,8 @@ spdk_idxd_put_channel(struct spdk_idxd_io_channel *chan)
 	assert(chan != NULL);
 
 	if (chan->batch) {
-		idxd_batch_cancel(chan, chan->batch);
-		chan->batch = NULL;
+		assert(chan->batch->transparent);
+		idxd_batch_cancel(chan, chan->batch, -ECANCELED);
 	}
 
 	pthread_mutex_lock(&chan->idxd->num_channels_lock);
@@ -358,10 +359,14 @@ _idxd_prep_command(struct spdk_idxd_io_channel *chan, spdk_idxd_req_cb cb_fn,
 {
 	struct idxd_hw_desc *desc;
 	struct idxd_ops *op;
+	uint64_t comp_addr;
 
 	if (!TAILQ_EMPTY(&chan->ops_pool)) {
 		op = *_op = TAILQ_FIRST(&chan->ops_pool);
 		desc = *_desc = op->desc;
+		comp_addr = desc->completion_addr;
+		memset(desc, 0, sizeof(*desc));
+		desc->completion_addr = comp_addr;
 		TAILQ_REMOVE(&chan->ops_pool, op, link);
 	} else {
 		/* The application needs to handle this, violation of flow control */
@@ -397,8 +402,7 @@ _idxd_prep_batch_cmd(struct spdk_idxd_io_channel *chan, spdk_idxd_req_cb cb_fn,
 
 	assert(batch != NULL); /* suppress scan-build warning. */
 	if (batch->index == DESC_PER_BATCH) {
-		SPDK_ERRLOG("Attempt to add to a batch that is already full.\n");
-		return -EINVAL;
+		return -EBUSY;
 	}
 
 	desc = *_desc = &batch->user_desc[batch->index];
@@ -418,7 +422,7 @@ _idxd_prep_batch_cmd(struct spdk_idxd_io_channel *chan, spdk_idxd_req_cb cb_fn,
 }
 
 static struct idxd_batch *
-idxd_batch_create(struct spdk_idxd_io_channel *chan)
+idxd_batch_create(struct spdk_idxd_io_channel *chan, bool transparent)
 {
 	struct idxd_batch *batch;
 
@@ -428,6 +432,11 @@ idxd_batch_create(struct spdk_idxd_io_channel *chan)
 		batch = TAILQ_FIRST(&chan->batch_pool);
 		batch->index = 0;
 		batch->chan = chan;
+		batch->transparent = transparent;
+		if (transparent) {
+			/* this is the active transparent batch */
+			chan->batch = batch;
+		}
 		TAILQ_REMOVE(&chan->batch_pool, batch, link);
 	} else {
 		/* The application needs to handle this. */
@@ -447,8 +456,11 @@ _free_batch(struct idxd_batch *batch, struct spdk_idxd_io_channel *chan)
 }
 
 static int
-idxd_batch_cancel(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch)
+idxd_batch_cancel(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch, int status)
 {
+	struct idxd_ops *op;
+	int i;
+
 	assert(chan != NULL);
 	assert(batch != NULL);
 
@@ -457,9 +469,20 @@ idxd_batch_cancel(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch)
 		return -EINVAL;
 	}
 
-	if (batch->index > 0) {
+	if (batch->index == UINT8_MAX) {
 		SPDK_ERRLOG("Cannot cancel batch, already submitted to HW.\n");
 		return -EINVAL;
+	}
+
+	if (batch->transparent) {
+		chan->batch = NULL;
+	}
+
+	for (i = 0; i < batch->index; i++) {
+		op = &batch->user_ops[i];
+		if (op->cb_fn) {
+			op->cb_fn(op->cb_arg, status);
+		}
 	}
 
 	_free_batch(batch, chan);
@@ -484,7 +507,7 @@ idxd_batch_submit(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
 	}
 
 	if (batch->index == 0) {
-		return idxd_batch_cancel(chan, batch);
+		return idxd_batch_cancel(chan, batch, 0);
 	}
 
 	/* Common prep. */
@@ -503,7 +526,8 @@ idxd_batch_submit(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
 		op->cb_fn = batch->user_ops[0].cb_fn;
 		op->cb_arg = batch->user_ops[0].cb_arg;
 		op->crc_dst = batch->user_ops[0].crc_dst;
-		_free_batch(batch, chan);
+		batch->index = 0;
+		idxd_batch_cancel(chan, batch, 0);
 	} else {
 		/* Command specific. */
 		desc->opcode = IDXD_OPCODE_BATCH;
@@ -516,6 +540,11 @@ idxd_batch_submit(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch,
 		for (i = 0 ; i < batch->index; i++) {
 			TAILQ_INSERT_TAIL(&chan->ops_outstanding, (struct idxd_ops *)&batch->user_ops[i],
 					  link);
+		}
+		batch->index = UINT8_MAX;
+		if (batch->transparent == true) {
+			/* for transparent batching, once we submit this batch it is no longer availablee */
+			chan->batch = NULL;
 		}
 	}
 
@@ -532,13 +561,12 @@ _idxd_setup_batch(struct spdk_idxd_io_channel *chan)
 	struct idxd_batch *batch;
 
 	if (chan->batch == NULL) {
-		/* Open a new batch */
-		batch = idxd_batch_create(chan);
+		/* Open a new transparent batch */
+		batch = idxd_batch_create(chan, true);
 		if (batch == NULL) {
 			return -EBUSY;
 		}
-		chan->batch = batch;
-	}
+	} /* else use the existing one */
 
 	return 0;
 }
@@ -549,12 +577,17 @@ _idxd_flush_batch(struct spdk_idxd_io_channel *chan)
 	int rc;
 
 	if (chan->batch != NULL && chan->batch->index >= DESC_PER_BATCH) {
+		assert(chan->batch->transparent);
+
 		/* Close out the full batch */
 		rc = idxd_batch_submit(chan, chan->batch, NULL, NULL);
-		if (rc < 0) {
-			return rc;
+		if (rc) {
+			assert(rc == -EBUSY);
+			/* return 0 here as this is a transparent batch and we want to try again
+			 * internally.
+			 */
+			return 0;
 		}
-		chan->batch = NULL;
 	}
 
 	return 0;
@@ -581,7 +614,7 @@ _idxd_submit_copy_single(struct spdk_idxd_io_channel *chan, void *dst, const voi
 	/* Common prep. */
 	rc = _idxd_prep_batch_cmd(chan, cb_fn, cb_arg, chan->batch, &desc, &op);
 	if (rc) {
-		goto error;
+		return rc;
 	}
 
 	rc = _vtophys(src, &src_addr, nbytes);
@@ -604,8 +637,7 @@ _idxd_submit_copy_single(struct spdk_idxd_io_channel *chan, void *dst, const voi
 	return _idxd_flush_batch(chan);
 
 error:
-	idxd_batch_cancel(chan, chan->batch);
-	chan->batch = NULL;
+	chan->batch->index--;
 	return rc;
 }
 
@@ -641,11 +673,17 @@ spdk_idxd_submit_copy(struct spdk_idxd_io_channel *chan,
 
 	if (chan->batch) {
 		/* Close out existing batch */
-		idxd_batch_submit(chan, chan->batch, NULL, NULL);
-		chan->batch = NULL;
+		rc = idxd_batch_submit(chan, chan->batch, NULL, NULL);
+		if (rc) {
+			assert(rc == -EBUSY);
+			/* we can't submit the existing transparent batch so reply to the incoming
+			 * op that we are busy so it will try again.
+			 */
+			return -EBUSY;
+		}
 	}
 
-	batch = idxd_batch_create(chan);
+	batch = idxd_batch_create(chan, false);
 	if (!batch) {
 		return -EBUSY;
 	}
@@ -674,10 +712,15 @@ spdk_idxd_submit_copy(struct spdk_idxd_io_channel *chan,
 		desc->xfer_size = len;
 	}
 
-	return idxd_batch_submit(chan, batch, cb_fn, cb_arg);
+	rc = idxd_batch_submit(chan, batch, cb_fn, cb_arg);
+	if (rc) {
+		assert(rc == -EBUSY);
+		goto err;
+	}
 
+	return 0;
 err:
-	idxd_batch_cancel(chan, batch);
+	idxd_batch_cancel(chan, batch, rc);
 	return rc;
 }
 
@@ -760,7 +803,7 @@ _idxd_submit_compare_single(struct spdk_idxd_io_channel *chan, void *src1, const
 	/* Common prep. */
 	rc = _idxd_prep_batch_cmd(chan, cb_fn, cb_arg, chan->batch, &desc, &op);
 	if (rc) {
-		goto error;
+		return rc;
 	}
 
 	rc = _vtophys(src1, &src1_addr, nbytes);
@@ -782,8 +825,7 @@ _idxd_submit_compare_single(struct spdk_idxd_io_channel *chan, void *src1, const
 	return _idxd_flush_batch(chan);
 
 error:
-	idxd_batch_cancel(chan, chan->batch);
-	chan->batch = NULL;
+	chan->batch->index--;
 	return rc;
 }
 
@@ -814,11 +856,17 @@ spdk_idxd_submit_compare(struct spdk_idxd_io_channel *chan,
 
 	if (chan->batch) {
 		/* Close out existing batch */
-		idxd_batch_submit(chan, chan->batch, NULL, NULL);
-		chan->batch = NULL;
+		rc = idxd_batch_submit(chan, chan->batch, NULL, NULL);
+		if (rc) {
+			assert(rc == -EBUSY);
+			/* we can't submit the existing transparent batch so reply to the incoming
+			 * op that we are busy so it will try again.
+			 */
+			return -EBUSY;
+		}
 	}
 
-	batch = idxd_batch_create(chan);
+	batch = idxd_batch_create(chan, false);
 	if (!batch) {
 		return -EBUSY;
 	}
@@ -847,10 +895,15 @@ spdk_idxd_submit_compare(struct spdk_idxd_io_channel *chan,
 		desc->xfer_size = len;
 	}
 
-	return idxd_batch_submit(chan, batch, cb_fn, cb_arg);
+	rc = idxd_batch_submit(chan, batch, cb_fn, cb_arg);
+	if (rc) {
+		assert(rc == -EBUSY);
+		goto err;
+	}
 
+	return 0;
 err:
-	idxd_batch_cancel(chan, batch);
+	idxd_batch_cancel(chan, batch, rc);
 	return rc;
 }
 
@@ -874,7 +927,7 @@ _idxd_submit_fill_single(struct spdk_idxd_io_channel *chan, void *dst, uint64_t 
 	/* Common prep. */
 	rc = _idxd_prep_batch_cmd(chan, cb_fn, cb_arg, chan->batch, &desc, &op);
 	if (rc) {
-		goto error;
+		return rc;
 	}
 
 	rc = _vtophys(dst, &dst_addr, nbytes);
@@ -892,8 +945,7 @@ _idxd_submit_fill_single(struct spdk_idxd_io_channel *chan, void *dst, uint64_t 
 	return _idxd_flush_batch(chan);
 
 error:
-	idxd_batch_cancel(chan, chan->batch);
-	chan->batch = NULL;
+	chan->batch->index--;
 	return rc;
 }
 
@@ -917,11 +969,17 @@ spdk_idxd_submit_fill(struct spdk_idxd_io_channel *chan,
 
 	if (chan->batch) {
 		/* Close out existing batch */
-		idxd_batch_submit(chan, chan->batch, NULL, NULL);
-		chan->batch = NULL;
+		rc = idxd_batch_submit(chan, chan->batch, NULL, NULL);
+		if (rc) {
+			assert(rc == -EBUSY);
+			/* we can't submit the existing transparent batch so reply to the incoming
+			 * op that we are busy so it will try again.
+			 */
+			return -EBUSY;
+		}
 	}
 
-	batch = idxd_batch_create(chan);
+	batch = idxd_batch_create(chan, false);
 	if (!batch) {
 		return -EBUSY;
 	}
@@ -944,10 +1002,15 @@ spdk_idxd_submit_fill(struct spdk_idxd_io_channel *chan,
 		desc->flags |= IDXD_FLAG_CACHE_CONTROL; /* direct IO to CPU cache instead of mem */
 	}
 
-	return idxd_batch_submit(chan, batch, cb_fn, cb_arg);
+	rc = idxd_batch_submit(chan, batch, cb_fn, cb_arg);
+	if (rc) {
+		assert(rc == -EBUSY);
+		goto err;
+	}
 
+	return 0;
 err:
-	idxd_batch_cancel(chan, batch);
+	idxd_batch_cancel(chan, batch, rc);
 	return rc;
 }
 
@@ -973,7 +1036,7 @@ _idxd_submit_crc32c_single(struct spdk_idxd_io_channel *chan, uint32_t *crc_dst,
 	/* Common prep. */
 	rc = _idxd_prep_batch_cmd(chan, cb_fn, cb_arg, chan->batch, &desc, &op);
 	if (rc) {
-		goto error;
+		return rc;
 	}
 
 	rc = _vtophys(src, &src_addr, nbytes);
@@ -983,7 +1046,6 @@ _idxd_submit_crc32c_single(struct spdk_idxd_io_channel *chan, uint32_t *crc_dst,
 
 	/* Command specific. */
 	desc->opcode = IDXD_OPCODE_CRC32C_GEN;
-	desc->dst_addr = 0; /* Per spec, needs to be clear. */
 	desc->src_addr = src_addr;
 	desc->flags &= IDXD_CLEAR_CRC_FLAGS;
 	desc->crc32c.seed = seed;
@@ -993,8 +1055,7 @@ _idxd_submit_crc32c_single(struct spdk_idxd_io_channel *chan, uint32_t *crc_dst,
 	return _idxd_flush_batch(chan);
 
 error:
-	idxd_batch_cancel(chan, chan->batch);
-	chan->batch = NULL;
+	chan->batch->index--;
 	return rc;
 }
 
@@ -1020,11 +1081,17 @@ spdk_idxd_submit_crc32c(struct spdk_idxd_io_channel *chan,
 
 	if (chan->batch) {
 		/* Close out existing batch */
-		idxd_batch_submit(chan, chan->batch, NULL, NULL);
-		chan->batch = NULL;
+		rc = idxd_batch_submit(chan, chan->batch, NULL, NULL);
+		if (rc) {
+			assert(rc == -EBUSY);
+			/* we can't submit the existing transparent batch so reply to the incoming
+			 * op that we are busy so it will try again.
+			 */
+			return -EBUSY;
+		}
 	}
 
-	batch = idxd_batch_create(chan);
+	batch = idxd_batch_create(chan, false);
 	if (!batch) {
 		return -EBUSY;
 	}
@@ -1042,7 +1109,6 @@ spdk_idxd_submit_crc32c(struct spdk_idxd_io_channel *chan,
 		}
 
 		desc->opcode = IDXD_OPCODE_CRC32C_GEN;
-		desc->dst_addr = 0; /* Per spec, needs to be clear. */
 		desc->src_addr = src_addr;
 		if (i == 0) {
 			desc->crc32c.seed = seed;
@@ -1060,10 +1126,15 @@ spdk_idxd_submit_crc32c(struct spdk_idxd_io_channel *chan,
 		op->crc_dst = crc_dst;
 	}
 
-	return idxd_batch_submit(chan, batch, cb_fn, cb_arg);
+	rc = idxd_batch_submit(chan, batch, cb_fn, cb_arg);
+	if (rc) {
+		assert(rc == -EBUSY);
+		goto err;
+	}
 
+	return 0;
 err:
-	idxd_batch_cancel(chan, batch);
+	idxd_batch_cancel(chan, batch, rc);
 	return rc;
 }
 
@@ -1090,7 +1161,7 @@ _idxd_submit_copy_crc32c_single(struct spdk_idxd_io_channel *chan, void *dst, vo
 	/* Common prep. */
 	rc = _idxd_prep_batch_cmd(chan, cb_fn, cb_arg, chan->batch, &desc, &op);
 	if (rc) {
-		goto error;
+		return rc;
 	}
 
 	rc = _vtophys(src, &src_addr, nbytes);
@@ -1115,8 +1186,7 @@ _idxd_submit_copy_crc32c_single(struct spdk_idxd_io_channel *chan, void *dst, vo
 	return _idxd_flush_batch(chan);
 
 error:
-	idxd_batch_cancel(chan, chan->batch);
-	chan->batch = NULL;
+	chan->batch->index--;
 	return rc;
 }
 
@@ -1149,11 +1219,17 @@ spdk_idxd_submit_copy_crc32c(struct spdk_idxd_io_channel *chan,
 
 	if (chan->batch) {
 		/* Close out existing batch */
-		idxd_batch_submit(chan, chan->batch, NULL, NULL);
-		chan->batch = NULL;
+		rc = idxd_batch_submit(chan, chan->batch, NULL, NULL);
+		if (rc) {
+			assert(rc == -EBUSY);
+			/* we can't submit the existing transparent batch so reply to the incoming
+			 * op that we are busy so it will try again.
+			 */
+			return -EBUSY;
+		}
 	}
 
-	batch = idxd_batch_create(chan);
+	batch = idxd_batch_create(chan, false);
 	if (!batch) {
 		return -EBUSY;
 	}
@@ -1196,10 +1272,15 @@ spdk_idxd_submit_copy_crc32c(struct spdk_idxd_io_channel *chan,
 		op->crc_dst = crc_dst;
 	}
 
-	return idxd_batch_submit(chan, batch, cb_fn, cb_arg);
+	rc = idxd_batch_submit(chan, batch, cb_fn, cb_arg);
+	if (rc) {
+		assert(rc == -EBUSY);
+		goto err;
+	}
 
+	return 0;
 err:
-	idxd_batch_cancel(chan, batch);
+	idxd_batch_cancel(chan, batch, rc);
 	return rc;
 }
 
@@ -1221,7 +1302,7 @@ spdk_idxd_process_events(struct spdk_idxd_io_channel *chan)
 {
 	struct idxd_ops *op, *tmp;
 	int status = 0;
-	int rc = 0;
+	int rc2, rc = 0;
 	void *cb_arg;
 	spdk_idxd_req_cb cb_fn;
 
@@ -1284,8 +1365,10 @@ spdk_idxd_process_events(struct spdk_idxd_io_channel *chan)
 
 	/* Submit any built-up batch */
 	if (chan->batch) {
-		idxd_batch_submit(chan, chan->batch, NULL, NULL);
-		chan->batch = NULL;
+		rc2 = idxd_batch_submit(chan, chan->batch, NULL, NULL);
+		if (rc2) {
+			assert(rc2 == -EBUSY);
+		}
 	}
 
 	return rc;
